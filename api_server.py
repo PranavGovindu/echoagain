@@ -55,11 +55,11 @@ DEFAULT_CFG_TEXT = 3.0
 DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
-DEFAULT_EARLY_STOP = True
-DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
-DEFAULT_ZERO_TAIL_FRAMES = 16
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.90  # lowered from 0.95 to allow some outliers
-DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
+DEFAULT_EARLY_STOP = False
+DEFAULT_ZERO_EPS = 5.0e-3  # stricter near-zero threshold for softer tail trimming
+DEFAULT_ZERO_TAIL_FRAMES = 32
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.99
+DEFAULT_ZERO_TAIL_ABSMAX = 0.1
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
@@ -1255,8 +1255,8 @@ def _generate_full_audio_bytes(
 
         audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
 
-        # Apply 50ms fadeout to avoid clicks at end
-        fadeout_samples = min(int(0.05 * SAMPLE_RATE), audio_out.shape[-1])
+        # Apply fadeout to avoid clicks at end
+        fadeout_samples = min(int(0.12 * SAMPLE_RATE), audio_out.shape[-1])
         if fadeout_samples > 0:
             t = torch.linspace(0.0, 1.0, fadeout_samples, device=audio_out.device)
             fade = (1.0 - t) ** 3
@@ -1829,9 +1829,9 @@ def _stream_blocks(
             ttfb_reported = True
 
         if new_audio.numel() > 0:
-            # Apply 50ms fadeout on last block to avoid clicks
+            # Apply fadeout on last block to avoid clicks
             if will_finish:
-                fadeout_samples = min(int(0.05 * SAMPLE_RATE), new_audio.shape[-1])
+                fadeout_samples = min(int(0.12 * SAMPLE_RATE), new_audio.shape[-1])
                 if fadeout_samples > 0:
                     # Power curve fade: gradual at start, steeper drop at end
                     t = torch.linspace(0.0, 1.0, fadeout_samples, device=new_audio.device)

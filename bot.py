@@ -16,16 +16,29 @@ import sys
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Awaitable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlencode
+from typing import Any, AsyncGenerator, Awaitable, Dict, List, Optional, Sequence, Tuple
 from enum import Enum
 
-from bson import ObjectId
-from bson.errors import InvalidId
-from pymongo import MongoClient
+try:
+    from bson import ObjectId
+    from bson.errors import InvalidId
+except Exception:
+    ObjectId = None  # type: ignore[assignment]
+    class InvalidId(Exception):
+        pass
+try:
+    from pymongo import MongoClient
+except Exception:
+    MongoClient = None  # type: ignore[assignment]
 from google.cloud import storage
 
 from dotenv import load_dotenv
 from loguru import logger
+try:
+    import aiohttp
+except ImportError as exc:
+    raise ImportError("aiohttp is required. Install with: pip install aiohttp") from exc
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -35,9 +48,15 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
 )
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
+    CancelFrame,
     EndFrame,
+    Frame,
     InterruptionFrame,
     LLMRunFrame,
+    StartFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -49,7 +68,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from custom_echo_tts_service import EchoTTSService
+from pipecat.services.tts_service import TTSService
 from pipecat.processors.transcript_processor import TranscriptProcessor
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.processors.user_idle_processor import UserIdleProcessor
@@ -92,6 +111,267 @@ load_dotenv(override=True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logger.remove()
 logger.add(sys.stderr, level=LOG_LEVEL)
+
+class EchoTTSService(TTSService):
+    """
+    Echo TTS Service for Pipecat.
+
+    Connects to an Echo TTS server via HTTP streaming or WebSocket and streams
+    PCM16 audio chunks (44.1kHz, int16, mono).
+    """
+
+    def __init__(
+        self,
+        *,
+        server_url: Optional[str] = None,
+        voice: str = "expresso_02_ex03-ex01_calm_005",
+        cfg_scale_text: float = 2.5,
+        cfg_scale_speaker: float = 5.0,
+        seed: int = 0,
+        sample_rate: int = 44100,
+        transport: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(sample_rate=sample_rate, **kwargs)
+
+        self._server_url = server_url or os.environ.get("ECHO_SERVER_URL")
+        if not self._server_url:
+            raise ValueError(
+                "Echo TTS server URL is required. "
+                "Provide server_url parameter or set ECHO_SERVER_URL environment variable."
+            )
+
+        # Normalize URL for HTTP usage
+        if self._server_url.startswith("ws://"):
+            self._server_url = "http://" + self._server_url[5:]
+        elif self._server_url.startswith("wss://"):
+            self._server_url = "https://" + self._server_url[6:]
+        elif not self._server_url.startswith(("http://", "https://")):
+            self._server_url = "http://" + self._server_url
+
+        self._server_url = self._server_url.rstrip("/")
+        self._voice = voice
+        self._cfg_scale_text = cfg_scale_text
+        self._cfg_scale_speaker = cfg_scale_speaker
+        self._seed = seed
+        self._sample_rate = sample_rate
+
+        transport_raw = transport or os.environ.get("ECHO_TTS_TRANSPORT", "http")
+        self._transport = transport_raw.strip().lower()
+        if self._transport not in {"http", "ws", "auto"}:
+            logger.warning("Unknown ECHO_TTS_TRANSPORT '{}', defaulting to http", self._transport)
+            self._transport = "http"
+
+        logger.info(
+            "Echo TTS Service initialized with server: {} (transport={})",
+            self._server_url,
+            self._transport,
+        )
+
+    def can_generate_metrics(self) -> bool:
+        return True
+
+    @property
+    def voice(self) -> str:
+        return self._voice
+
+    @voice.setter
+    def voice(self, value: str):
+        self._voice = value
+        logger.info("Echo TTS voice changed to: {}", value)
+
+    async def set_voice(self, voice: str):
+        self._voice = voice
+        logger.info("Echo TTS voice set to: {}", voice)
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        logger.info("Echo TTS Service started")
+
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
+        logger.info("Echo TTS Service stopped")
+
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        logger.info("Echo TTS generation cancelled")
+
+    def _build_websocket_url(self, text: str) -> str:
+        base_url = self._server_url
+        if base_url.startswith("http://"):
+            base_url = "ws://" + base_url[7:]
+        elif base_url.startswith("https://"):
+            base_url = "wss://" + base_url[8:]
+        elif not base_url.startswith(("ws://", "wss://")):
+            base_url = "ws://" + base_url
+
+        params = {
+            "text": text,
+            "voice": self._voice,
+            "cfg_scale_text": str(self._cfg_scale_text),
+            "cfg_scale_speaker": str(self._cfg_scale_speaker),
+            "seed": str(self._seed),
+        }
+        return f"{base_url}/stream?{urlencode(params)}"
+
+    async def _run_tts_http(self, text: str) -> AsyncGenerator[Frame, None]:
+        endpoint_url = f"{self._server_url}/v1/audio/speech"
+        logger.debug("Connecting to Echo TTS HTTP endpoint: {}", endpoint_url)
+
+        payload = {
+            "model": "echo-tts",
+            "input": text,
+            "voice": self._voice,
+            "response_format": "pcm",
+            "stream": True,
+            "extra_body": {
+                "cfg_scale_text": self._cfg_scale_text,
+                "cfg_scale_speaker": self._cfg_scale_speaker,
+                "seed": self._seed,
+            },
+        }
+
+        yield TTSStartedFrame()
+
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                endpoint_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/octet-stream",
+                },
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    error_msg = f"Echo TTS HTTP error {response.status}: {error_text}"
+                    logger.error(
+                        "{} | URL: {} | Payload keys: {}",
+                        error_msg,
+                        endpoint_url,
+                        list(payload.keys()),
+                    )
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=error_text,
+                        headers=response.headers,
+                    )
+
+                content_type = response.headers.get("Content-Type", "")
+                sample_rate_header = response.headers.get("X-Audio-Sample-Rate")
+                if sample_rate_header:
+                    try:
+                        detected_rate = int(sample_rate_header)
+                        if detected_rate != self._sample_rate:
+                            logger.warning(
+                                "Server sample rate ({}) differs from configured ({}). Using server rate.",
+                                detected_rate,
+                                self._sample_rate,
+                            )
+                            self._sample_rate = detected_rate
+                    except ValueError:
+                        pass
+
+                logger.debug(
+                    "Streaming response: Content-Type={}, Sample-Rate={}",
+                    content_type,
+                    sample_rate_header,
+                )
+
+                buffer = bytearray()
+                bytes_per_sample = 2
+                try:
+                    async for chunk in response.content.iter_chunked(8192):
+                        if chunk:
+                            buffer.extend(chunk)
+                            complete_samples = len(buffer) // bytes_per_sample
+                            if complete_samples > 0:
+                                complete_bytes = complete_samples * bytes_per_sample
+                                frame_data = bytes(buffer[:complete_bytes])
+                                buffer = buffer[complete_bytes:]
+                                yield TTSAudioRawFrame(
+                                    audio=frame_data,
+                                    sample_rate=self._sample_rate,
+                                    num_channels=1,
+                                )
+                except aiohttp.ClientPayloadError as exc:
+                    logger.warning("Echo TTS stream ended early: {}", exc)
+
+                if len(buffer) > 0:
+                    if len(buffer) % bytes_per_sample != 0:
+                        buffer.extend(b"\x00" * (bytes_per_sample - (len(buffer) % bytes_per_sample)))
+                    if len(buffer) > 0:
+                        yield TTSAudioRawFrame(
+                            audio=bytes(buffer),
+                            sample_rate=self._sample_rate,
+                            num_channels=1,
+                        )
+
+        yield TTSStoppedFrame()
+
+    async def _run_tts_ws(self, text: str) -> AsyncGenerator[Frame, None]:
+        try:
+            import websockets
+        except ImportError as exc:
+            raise ImportError(
+                "websockets is required for ws transport. Install with: pip install websockets"
+            ) from exc
+
+        ws_url = self._build_websocket_url(text)
+        logger.debug("Connecting to Echo TTS WebSocket: {}...", ws_url[:100])
+
+        yield TTSStartedFrame()
+        async with websockets.connect(
+            ws_url,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            max_size=None,
+        ) as websocket:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    yield TTSAudioRawFrame(
+                        audio=message,
+                        sample_rate=self._sample_rate,
+                        num_channels=1,
+                    )
+                elif isinstance(message, str):
+                    logger.debug("Echo TTS log: {}", message)
+
+        yield TTSStoppedFrame()
+
+    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+        if not text or not text.strip():
+            logger.warning("Empty text provided to Echo TTS")
+            return
+
+        logger.debug("Echo TTS generating speech for: {}...", text[:50])
+
+        try:
+            if self._transport == "ws":
+                async for frame in self._run_tts_ws(text):
+                    yield frame
+            elif self._transport == "auto":
+                try:
+                    async for frame in self._run_tts_http(text):
+                        yield frame
+                except aiohttp.ClientError as exc:
+                    logger.warning("HTTP TTS failed, retrying over WebSocket: {}", exc)
+                    async for frame in self._run_tts_ws(text):
+                        yield frame
+            else:
+                async for frame in self._run_tts_http(text):
+                    yield frame
+        except aiohttp.ClientError as e:
+            logger.error("Echo TTS connection error: {}", e)
+            yield TTSStoppedFrame()
+        except Exception as e:
+            logger.error("Echo TTS error: {}", e)
+            yield TTSStoppedFrame()
+
 
 _TMP_GCP_CREDS = Path("/tmp/gcp_sa.json")
 
@@ -193,7 +473,10 @@ def _maybe_create_krisp_filter():
         return None
 
 
-MONGODB_URI = "mongodb+srv://internal:rumi_ai_41921_mongo@cluster0.ds0nghe.mongodb.net/ira_rumik?retryWrites=true&w=majority&appName=Cluster0"
+MONGODB_URI = os.getenv("MONGODB_URI", "")
+MONGO_ENABLED = bool(MONGODB_URI) and MongoClient is not None
+if MONGODB_URI and MongoClient is None:
+    logger.warning("MongoDB URI is set but pymongo is unavailable; MongoDB disabled.")
 MONGODB_DB_NAME = "ira_rumik"
 MONGODB_TIMEOUT_MS = 5000
 RUMIK_SUMMARY_LIMIT = 5
@@ -1147,6 +1430,8 @@ async def _upload_to_gcs(
 def _maybe_object_id(value: Optional[str]) -> Optional[ObjectId]:
     if not value:
         return None
+    if ObjectId is None:
+        return None
     try:
         return ObjectId(value)
     except (InvalidId, TypeError):
@@ -1179,7 +1464,7 @@ def _load_user_name_and_summaries(
     user_id: Optional[str] = None,
     chemistry_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], List[dict], List[dict]]:
-    if not MONGODB_URI:
+    if not MONGO_ENABLED:
         return None, None, [], []
 
     client: Optional[MongoClient] = None
@@ -1704,7 +1989,7 @@ def _load_recent_call_summaries(
     Returns a list of dicts with keys: session_id (str), created_at (ISO str),
     created_at_ist (datetime or None), text (str).
     """
-    if not MONGODB_URI or not user_id:
+    if not MONGO_ENABLED or not user_id:
         return []
 
     client: Optional[MongoClient] = None
@@ -1785,7 +2070,7 @@ async def _persist_call_documents(
     call_end: datetime,
     recording_urls: Dict[str, str],
 ) -> None:
-    if not MONGODB_URI:
+    if not MONGO_ENABLED:
         logger.debug("Skipping call persistence; MongoDB URI not configured.")
         return
 
@@ -1897,7 +2182,7 @@ async def _persist_extracted_user_facts(
     This appends new facts to the chemistry's userInformation array,
     avoiding exact duplicates.
     """
-    if not MONGODB_URI:
+    if not MONGO_ENABLED:
         logger.debug("Skipping fact persistence; MongoDB URI not configured.")
         return
 

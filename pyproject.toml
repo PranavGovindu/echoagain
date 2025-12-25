@@ -5,7 +5,7 @@ description = "Pipecat voice agent with Gemini STT/LLM and Echo TTS"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "pipecat-ai[daily,google,silero,webrtc,runner]",
+    "pipecat-ai[daily,google,local-smart-turn-v3,runner,silero,webrtc]",
     "websockets",
     "numpy",
     "aiohttp",
@@ -15,7 +15,7 @@ dependencies = [
     "uvicorn",
     "pymongo",
     "google-cloud-storage",
-    "transformers>=4.57.3",
+    "pipecatcloud>=0.2.16",
 ]
 
 [build-system]
@@ -27,7 +27,6 @@ build-backend = "hatchling.build"
 # Just include the Python files
 only-include = [
     "bot.py",
-    "custom_echo_tts_service.py",
-    "custom_vibevoice_tts_service.py",
-    "test_local.py",
+    "custom_echo_tts_service.py"
+
 ]
