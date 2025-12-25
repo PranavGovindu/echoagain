@@ -57,11 +57,11 @@ DEFAULT_CFG_TEXT = 3.0
 DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
-DEFAULT_EARLY_STOP = True
-DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
-DEFAULT_ZERO_TAIL_FRAMES = 16
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95  # stricter tail check to avoid early truncation
-DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
+DEFAULT_EARLY_STOP = False
+DEFAULT_ZERO_EPS = 5.0e-3  # stricter near-zero threshold for a softer tail trim
+DEFAULT_ZERO_TAIL_FRAMES = 32
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.99
+DEFAULT_ZERO_TAIL_ABSMAX = 0.1  # tighter absmax so early stop is harder to trigger
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"

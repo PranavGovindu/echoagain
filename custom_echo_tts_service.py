@@ -8,6 +8,7 @@ and streams audio back to the Pipecat pipeline.
 import asyncio
 import os
 from typing import AsyncGenerator, Optional
+from urllib.parse import urlencode
 
 try:
     import aiohttp
@@ -46,6 +47,7 @@ class EchoTTSService(TTSService):
         cfg_scale_speaker: float = 5.0,
         seed: int = 0,
         sample_rate: int = 44100,
+        transport: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -86,7 +88,15 @@ class EchoTTSService(TTSService):
         self._seed = seed
         self._sample_rate = sample_rate
         
-        logger.info(f"Echo TTS Service initialized with server: {self._server_url}")
+        transport_raw = transport or os.environ.get("ECHO_TTS_TRANSPORT", "http")
+        self._transport = transport_raw.strip().lower()
+        if self._transport not in {"http", "ws", "auto"}:
+            logger.warning("Unknown ECHO_TTS_TRANSPORT '{}', defaulting to http", self._transport)
+            self._transport = "http"
+
+        logger.info(
+            f"Echo TTS Service initialized with server: {self._server_url} (transport={self._transport})"
+        )
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -120,6 +130,146 @@ class EchoTTSService(TTSService):
         await super().cancel(frame)
         logger.info("Echo TTS generation cancelled")
 
+    def _build_websocket_url(self, text: str) -> str:
+        base_url = self._server_url
+        if base_url.startswith("http://"):
+            base_url = "ws://" + base_url[7:]
+        elif base_url.startswith("https://"):
+            base_url = "wss://" + base_url[8:]
+        elif not base_url.startswith(("ws://", "wss://")):
+            base_url = "ws://" + base_url
+
+        params = {
+            "text": text,
+            "voice": self._voice,
+            "cfg_scale_text": str(self._cfg_scale_text),
+            "cfg_scale_speaker": str(self._cfg_scale_speaker),
+            "seed": str(self._seed),
+        }
+        return f"{base_url}/stream?{urlencode(params)}"
+
+    async def _run_tts_http(self, text: str) -> AsyncGenerator[Frame, None]:
+        endpoint_url = f"{self._server_url}/v1/audio/speech"
+        logger.debug(f"Connecting to Echo TTS HTTP endpoint: {endpoint_url}")
+
+        payload = {
+            "model": "echo-tts",
+            "input": text,
+            "voice": self._voice,
+            "response_format": "pcm",
+            "stream": True,
+            "extra_body": {
+                "cfg_scale_text": self._cfg_scale_text,
+                "cfg_scale_speaker": self._cfg_scale_speaker,
+                "seed": self._seed,
+            },
+        }
+
+        yield TTSStartedFrame()
+
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                endpoint_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/octet-stream",
+                },
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    error_msg = f"Echo TTS HTTP error {response.status}: {error_text}"
+                    logger.error(f"{error_msg} | URL: {endpoint_url} | Payload keys: {list(payload.keys())}")
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=error_text,
+                        headers=response.headers,
+                    )
+
+                content_type = response.headers.get("Content-Type", "")
+                sample_rate_header = response.headers.get("X-Audio-Sample-Rate")
+                if sample_rate_header:
+                    try:
+                        detected_rate = int(sample_rate_header)
+                        if detected_rate != self._sample_rate:
+                            logger.warning(
+                                "Server sample rate ({}) differs from configured ({}). Using server rate.",
+                                detected_rate,
+                                self._sample_rate,
+                            )
+                            self._sample_rate = detected_rate
+                    except ValueError:
+                        pass
+
+                logger.debug(
+                    "Streaming response: Content-Type={}, Sample-Rate={}",
+                    content_type,
+                    sample_rate_header,
+                )
+
+                buffer = bytearray()
+                bytes_per_sample = 2
+                try:
+                    async for chunk in response.content.iter_chunked(8192):
+                        if chunk:
+                            buffer.extend(chunk)
+                            complete_samples = len(buffer) // bytes_per_sample
+                            if complete_samples > 0:
+                                complete_bytes = complete_samples * bytes_per_sample
+                                frame_data = bytes(buffer[:complete_bytes])
+                                buffer = buffer[complete_bytes:]
+                                yield TTSAudioRawFrame(
+                                    audio=frame_data,
+                                    sample_rate=self._sample_rate,
+                                    num_channels=1,
+                                )
+                except aiohttp.ClientPayloadError as exc:
+                    logger.warning("Echo TTS stream ended early: {}", exc)
+
+                if len(buffer) > 0:
+                    if len(buffer) % bytes_per_sample != 0:
+                        buffer.extend(b"\x00" * (bytes_per_sample - (len(buffer) % bytes_per_sample)))
+                    if len(buffer) > 0:
+                        yield TTSAudioRawFrame(
+                            audio=bytes(buffer),
+                            sample_rate=self._sample_rate,
+                            num_channels=1,
+                        )
+
+        yield TTSStoppedFrame()
+
+    async def _run_tts_ws(self, text: str) -> AsyncGenerator[Frame, None]:
+        try:
+            import websockets
+        except ImportError as exc:
+            raise ImportError("websockets is required for ws transport. Install with: pip install websockets") from exc
+
+        ws_url = self._build_websocket_url(text)
+        logger.debug(f"Connecting to Echo TTS WebSocket: {ws_url[:100]}...")
+
+        yield TTSStartedFrame()
+        async with websockets.connect(
+            ws_url,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            max_size=None,
+        ) as websocket:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    yield TTSAudioRawFrame(
+                        audio=message,
+                        sample_rate=self._sample_rate,
+                        num_channels=1,
+                    )
+                elif isinstance(message, str):
+                    logger.debug(f"Echo TTS log: {message}")
+
+        yield TTSStoppedFrame()
+
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         """
         Generate speech from text using Echo TTS server.
@@ -136,105 +286,26 @@ class EchoTTSService(TTSService):
 
         logger.debug(f"Echo TTS generating speech for: {text[:50]}...")
 
-        # Build HTTP endpoint URL
-        endpoint_url = f"{self._server_url}/v1/audio/speech"
-        logger.debug(f"Connecting to Echo TTS HTTP endpoint: {endpoint_url}")
-
-        # Prepare request payload matching Echo TTS API format
-        payload = {
-            "model": "echo-tts",  # Optional but included for compatibility
-            "input": text,
-            "voice": self._voice,
-            "response_format": "pcm",  # Raw PCM for streaming
-            "stream": True,
-            "extra_body": {
-                "cfg_scale_text": self._cfg_scale_text,
-                "cfg_scale_speaker": self._cfg_scale_speaker,
-                "seed": self._seed,
-            }
-        }
-
         try:
-            # Signal TTS started
-            yield TTSStartedFrame()
-            
-            # Make HTTP POST request with streaming
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    endpoint_url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/octet-stream",
-                    },
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        error_msg = f"Echo TTS HTTP error {response.status}: {error_text}"
-                        logger.error(f"{error_msg} | URL: {endpoint_url} | Payload keys: {list(payload.keys())}")
-                        raise Exception(error_msg)
-                    
-                    # Check content type header
-                    content_type = response.headers.get("Content-Type", "")
-                    sample_rate_header = response.headers.get("X-Audio-Sample-Rate")
-                    if sample_rate_header:
-                        try:
-                            detected_rate = int(sample_rate_header)
-                            if detected_rate != self._sample_rate:
-                                logger.warning(
-                                    f"Server sample rate ({detected_rate}) differs from configured ({self._sample_rate}). "
-                                    f"Using server rate."
-                                )
-                                self._sample_rate = detected_rate
-                        except ValueError:
-                            pass
-                    
-                    logger.debug(f"Streaming response: Content-Type={content_type}, Sample-Rate={sample_rate_header}")
-                    
-                    # Buffer for incomplete PCM16 frames (2 bytes per sample)
-                    # PCM16 requires chunks to be multiples of 2 bytes
-                    buffer = bytearray()
-                    bytes_per_sample = 2  # int16 = 2 bytes
-                    
-                    # Stream audio chunks as they arrive
-                    async for chunk in response.content.iter_chunked(8192):
-                        if chunk:
-                            buffer.extend(chunk)
-                            
-                            # Only yield complete frames (multiples of 2 bytes)
-                            complete_samples = len(buffer) // bytes_per_sample
-                            if complete_samples > 0:
-                                complete_bytes = complete_samples * bytes_per_sample
-                                frame_data = bytes(buffer[:complete_bytes])
-                                buffer = buffer[complete_bytes:]
-                                
-                                # Echo TTS sends PCM16 (int16) bytes at 44.1kHz
-                                yield TTSAudioRawFrame(
-                                    audio=frame_data,
-                                    sample_rate=self._sample_rate,
-                                    num_channels=1,
-                                )
-                    
-                    # Yield any remaining buffered data (should be empty, but handle it)
-                    if len(buffer) > 0:
-                        # Pad to complete sample if needed (shouldn't happen, but safety)
-                        if len(buffer) % bytes_per_sample != 0:
-                            buffer.extend(b'\x00' * (bytes_per_sample - (len(buffer) % bytes_per_sample)))
-                        if len(buffer) > 0:
-                            yield TTSAudioRawFrame(
-                                audio=bytes(buffer),
-                                sample_rate=self._sample_rate,
-                                num_channels=1,
-                            )
-            
-            # Signal TTS stopped
-            yield TTSStoppedFrame()
-                
+            if self._transport == "ws":
+                async for frame in self._run_tts_ws(text):
+                    yield frame
+            elif self._transport == "auto":
+                try:
+                    async for frame in self._run_tts_http(text):
+                        yield frame
+                except aiohttp.ClientError as exc:
+                    logger.warning("HTTP TTS failed, retrying over WebSocket: {}", exc)
+                    async for frame in self._run_tts_ws(text):
+                        yield frame
+            else:
+                async for frame in self._run_tts_http(text):
+                    yield frame
         except aiohttp.ClientError as e:
-            logger.error(f"Echo TTS connection error: {e} | URL: {endpoint_url}")
+            logger.error("Echo TTS connection error: {}", e)
             yield TTSStoppedFrame()
         except Exception as e:
-            logger.error(f"Echo TTS error: {e} | URL: {endpoint_url}")
+            logger.error("Echo TTS error: {}", e)
             yield TTSStoppedFrame()
 
     async def get_available_voices(self) -> list[str]:
@@ -259,4 +330,3 @@ class EchoTTSService(TTSService):
         except Exception as e:
             logger.error(f"Error fetching voices: {e}")
             return []
-

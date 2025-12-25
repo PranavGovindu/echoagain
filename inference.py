@@ -329,11 +329,11 @@ def get_speaker_latent_and_mask(
 def find_flattening_point(
     data,
     target_value=0.0,
-    window_size=20,
-    std_threshold=0.1,
-    mean_abs_threshold=0.02,
-    max_abs_threshold=0.05,
-    min_runs=2,
+    window_size=32,
+    std_threshold=0.05,
+    mean_abs_threshold=0.01,
+    max_abs_threshold=0.03,
+    min_runs=3,
 ):
     """
     Heuristic to find the start of the flat (near-zero) tail of the latent sequence.
