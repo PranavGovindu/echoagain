@@ -162,18 +162,6 @@ class EchoTTSService(TTSService):
             logger.warning("Unknown ECHO_TTS_TRANSPORT '{}', defaulting to http", self._transport)
             self._transport = "http"
 
-        prelude_raw = os.environ.get("ECHO_PRELUDE_TEXT")
-        if prelude_raw is None:
-            prelude_raw = "Hello."
-        self._prelude_text = prelude_raw.strip()
-        gap_raw = os.environ.get("ECHO_PRELUDE_GAP_MS")
-        if gap_raw is None:
-            gap_raw = "30"
-        try:
-            self._prelude_gap_ms = max(0, int(gap_raw))
-        except ValueError:
-            self._prelude_gap_ms = 0
-
         logger.info(
             "Echo TTS Service initialized with server: {} (transport={})",
             self._server_url,
@@ -379,12 +367,6 @@ class EchoTTSService(TTSService):
         logger.debug("Echo TTS generating speech for: {}...", text[:50])
 
         try:
-            if self._prelude_text:
-                async for frame in self._run_tts_with_transport(self._prelude_text):
-                    yield frame
-                if self._prelude_gap_ms > 0:
-                    await asyncio.sleep(self._prelude_gap_ms / 1000.0)
-
             async for frame in self._run_tts_with_transport(text):
                 yield frame
         except aiohttp.ClientError as e:
