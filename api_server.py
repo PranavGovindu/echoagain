@@ -58,7 +58,7 @@ DEFAULT_CFG_MAX_T = 1.0
 DEFAULT_EARLY_STOP = True
 DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
 DEFAULT_ZERO_TAIL_FRAMES = 16
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.90  # lowered from 0.95 to allow some outliers
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95  # stricter tail check to avoid early truncation
 DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
@@ -103,7 +103,6 @@ _PERFORMANCE_PRESETS = {
     "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
     "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
     "equal": {"block_sizes": [213, 213, 214], "num_steps": [15, 15, 15]},  # 3x ~10s blocks
-    "superfast": {"block_sizes": [16, 112, 512], "num_steps": [4, 12, 20]},
 }
 if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
     preset = _PERFORMANCE_PRESETS[PERFORMANCE_PRESET]
