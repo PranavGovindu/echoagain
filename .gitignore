@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+exports_env.txt
 .idea/
 .vscode/
 api_generation.wav
