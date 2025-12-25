@@ -10,8 +10,6 @@ import io
 import wave
 import shutil
 import subprocess
-import warnings
-import warnings
 from dataclasses import dataclass, replace
 from contextlib import asynccontextmanager
 from functools import partial
@@ -57,11 +55,11 @@ DEFAULT_CFG_TEXT = 3.0
 DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
-DEFAULT_EARLY_STOP = False
-DEFAULT_ZERO_EPS = 5.0e-3  # stricter near-zero threshold for a softer tail trim
-DEFAULT_ZERO_TAIL_FRAMES = 32
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.99
-DEFAULT_ZERO_TAIL_ABSMAX = 0.1  # tighter absmax so early stop is harder to trigger
+DEFAULT_EARLY_STOP = True
+DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
+DEFAULT_ZERO_TAIL_FRAMES = 16
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.90  # lowered from 0.95 to allow some outliers
+DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
@@ -105,7 +103,6 @@ _PERFORMANCE_PRESETS = {
     "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
     "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
     "equal": {"block_sizes": [213, 213, 214], "num_steps": [15, 15, 15]},  # 3x ~10s blocks
-    "superfast": {"block_sizes": [16, 112, 512], "num_steps": [4, 12, 20]},
 }
 if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
     preset = _PERFORMANCE_PRESETS[PERFORMANCE_PRESET]
@@ -129,16 +126,6 @@ if LORA_FIRST_BLOCK:
 # Keep torch.compile caches on restarts similar to test_ttfb_optimization.py
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_cache")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-warnings.filterwarnings(
-    "ignore",
-    message=r".*rel\(\) was called on non-relation expression.*",
-    module=r"torch\.fx\.experimental\.symbolic_shapes",
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*rel\(\) was called on non-relation expression.*",
-    module=r"torch\.fx\.experimental\.symbolic_shapes",
-)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1268,8 +1255,8 @@ def _generate_full_audio_bytes(
 
         audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
 
-        # Apply fadeout to avoid clicks at end
-        fadeout_samples = min(int(0.12 * SAMPLE_RATE), audio_out.shape[-1])
+        # Apply 50ms fadeout to avoid clicks at end
+        fadeout_samples = min(int(0.05 * SAMPLE_RATE), audio_out.shape[-1])
         if fadeout_samples > 0:
             t = torch.linspace(0.0, 1.0, fadeout_samples, device=audio_out.device)
             fade = (1.0 - t) ** 3
@@ -1842,9 +1829,9 @@ def _stream_blocks(
             ttfb_reported = True
 
         if new_audio.numel() > 0:
-            # Apply fadeout on last block to avoid clicks
+            # Apply 50ms fadeout on last block to avoid clicks
             if will_finish:
-                fadeout_samples = min(int(0.12 * SAMPLE_RATE), new_audio.shape[-1])
+                fadeout_samples = min(int(0.05 * SAMPLE_RATE), new_audio.shape[-1])
                 if fadeout_samples > 0:
                     # Power curve fade: gradual at start, steeper drop at end
                     t = torch.linspace(0.0, 1.0, fadeout_samples, device=new_audio.device)
