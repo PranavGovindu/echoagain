@@ -168,7 +168,7 @@ class EchoTTSService(TTSService):
         self._prelude_text = prelude_raw.strip()
         gap_raw = os.environ.get("ECHO_PRELUDE_GAP_MS")
         if gap_raw is None:
-            gap_raw = "200"
+            gap_raw = "30"
         try:
             self._prelude_gap_ms = max(0, int(gap_raw))
         except ValueError:
@@ -379,11 +379,8 @@ class EchoTTSService(TTSService):
         logger.debug("Echo TTS generating speech for: {}...", text[:50])
 
         try:
-            prelude_text = self._prelude_text
-            if prelude_text and text.lstrip().lower().startswith(prelude_text.lower()):
-                prelude_text = ""
-            if prelude_text:
-                async for frame in self._run_tts_with_transport(prelude_text):
+            if self._prelude_text:
+                async for frame in self._run_tts_with_transport(self._prelude_text):
                     yield frame
                 if self._prelude_gap_ms > 0:
                     await asyncio.sleep(self._prelude_gap_ms / 1000.0)
