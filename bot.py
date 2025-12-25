@@ -2162,7 +2162,7 @@ def build_system_instruction(
 
     # Final instruction
     sections.append(
-        "\n---\n\nRESPOND NOW\nKeep it short, natural, and in English only."
+        "\n---\n\nRESPOND NOW\nUse English only, one sentence, about 25-40 words."
     )
 
     return "".join(sections).strip()
@@ -2185,7 +2185,7 @@ NO hashtags or special symbols
 Use ... for pauses
 Use commas for natural breaks
 
-Length: Keep responses to 1-3 sentences maximum unless a longer response trigger applies. This is a phone call, not a monologue.
+Length: Use one sentence of about 25-40 words. Even for short prompts, expand naturally with a brief follow-up clause.
 
 {filler_guidance}
 """

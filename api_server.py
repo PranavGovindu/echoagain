@@ -1268,8 +1268,8 @@ def _generate_full_audio_bytes(
 
         audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
 
-        # Apply 50ms fadeout to avoid clicks at end
-        fadeout_samples = min(int(0.05 * SAMPLE_RATE), audio_out.shape[-1])
+        # Apply fadeout to avoid clicks at end
+        fadeout_samples = min(int(0.12 * SAMPLE_RATE), audio_out.shape[-1])
         if fadeout_samples > 0:
             t = torch.linspace(0.0, 1.0, fadeout_samples, device=audio_out.device)
             fade = (1.0 - t) ** 3
@@ -1842,9 +1842,9 @@ def _stream_blocks(
             ttfb_reported = True
 
         if new_audio.numel() > 0:
-            # Apply 50ms fadeout on last block to avoid clicks
+            # Apply fadeout on last block to avoid clicks
             if will_finish:
-                fadeout_samples = min(int(0.05 * SAMPLE_RATE), new_audio.shape[-1])
+                fadeout_samples = min(int(0.12 * SAMPLE_RATE), new_audio.shape[-1])
                 if fadeout_samples > 0:
                     # Power curve fade: gradual at start, steeper drop at end
                     t = torch.linspace(0.0, 1.0, fadeout_samples, device=new_audio.device)
