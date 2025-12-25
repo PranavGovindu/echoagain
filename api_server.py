@@ -103,6 +103,7 @@ _PERFORMANCE_PRESETS = {
     "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
     "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
     "equal": {"block_sizes": [213, 213, 214], "num_steps": [15, 15, 15]},  # 3x ~10s blocks
+    "superfast": {"block_sizes": [16, 112, 512], "num_steps": [4, 12, 20]},
 }
 if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
     preset = _PERFORMANCE_PRESETS[PERFORMANCE_PRESET]
