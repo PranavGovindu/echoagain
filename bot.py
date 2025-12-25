@@ -162,6 +162,18 @@ class EchoTTSService(TTSService):
             logger.warning("Unknown ECHO_TTS_TRANSPORT '{}', defaulting to http", self._transport)
             self._transport = "http"
 
+        prelude_raw = os.environ.get("ECHO_PRELUDE_TEXT")
+        if prelude_raw is None:
+            prelude_raw = "Hello."
+        self._prelude_text = prelude_raw.strip()
+        gap_raw = os.environ.get("ECHO_PRELUDE_GAP_MS")
+        if gap_raw is None:
+            gap_raw = "200"
+        try:
+            self._prelude_gap_ms = max(0, int(gap_raw))
+        except ValueError:
+            self._prelude_gap_ms = 0
+
         logger.info(
             "Echo TTS Service initialized with server: {} (transport={})",
             self._server_url,
@@ -343,6 +355,22 @@ class EchoTTSService(TTSService):
 
         yield TTSStoppedFrame()
 
+    async def _run_tts_with_transport(self, text: str) -> AsyncGenerator[Frame, None]:
+        if self._transport == "ws":
+            async for frame in self._run_tts_ws(text):
+                yield frame
+        elif self._transport == "auto":
+            try:
+                async for frame in self._run_tts_http(text):
+                    yield frame
+            except aiohttp.ClientError as exc:
+                logger.warning("HTTP TTS failed, retrying over WebSocket: {}", exc)
+                async for frame in self._run_tts_ws(text):
+                    yield frame
+        else:
+            async for frame in self._run_tts_http(text):
+                yield frame
+
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         if not text or not text.strip():
             logger.warning("Empty text provided to Echo TTS")
@@ -351,20 +379,17 @@ class EchoTTSService(TTSService):
         logger.debug("Echo TTS generating speech for: {}...", text[:50])
 
         try:
-            if self._transport == "ws":
-                async for frame in self._run_tts_ws(text):
+            prelude_text = self._prelude_text
+            if prelude_text and text.lstrip().lower().startswith(prelude_text.lower()):
+                prelude_text = ""
+            if prelude_text:
+                async for frame in self._run_tts_with_transport(prelude_text):
                     yield frame
-            elif self._transport == "auto":
-                try:
-                    async for frame in self._run_tts_http(text):
-                        yield frame
-                except aiohttp.ClientError as exc:
-                    logger.warning("HTTP TTS failed, retrying over WebSocket: {}", exc)
-                    async for frame in self._run_tts_ws(text):
-                        yield frame
-            else:
-                async for frame in self._run_tts_http(text):
-                    yield frame
+                if self._prelude_gap_ms > 0:
+                    await asyncio.sleep(self._prelude_gap_ms / 1000.0)
+
+            async for frame in self._run_tts_with_transport(text):
+                yield frame
         except aiohttp.ClientError as e:
             logger.error("Echo TTS connection error: {}", e)
             yield TTSStoppedFrame()

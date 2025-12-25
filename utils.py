@@ -120,6 +120,7 @@ def preprocess_text(text: str, normalize_exclamation: bool = True) -> str:
 
     if text and not text.startswith("[") and not text.startswith("(") and "S1" not in text and "S2" not in text:
         text = f"[S1] {text}"
+    text = re.sub(r"^(\[S[12]\]\s*)['\"]+\s*", r"\1", text)
     return text
 
 
