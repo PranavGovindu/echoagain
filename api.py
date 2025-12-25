@@ -1,17 +1,12 @@
 import base64
 import gzip
-import json
 import math
 import os
-import random
-import re
 import tempfile
 import io
 import wave
 import shutil
 import subprocess
-import warnings
-import warnings
 from dataclasses import dataclass, replace
 from contextlib import asynccontextmanager
 from functools import partial
@@ -21,9 +16,12 @@ from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional,
 
 import torch
 import time
-from fastapi import Body, FastAPI, HTTPException, Request
+import asyncio
+import json
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 from fastapi.concurrency import iterate_in_threadpool
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 import torchaudio
@@ -58,10 +56,9 @@ DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
 DEFAULT_EARLY_STOP = True
-DEFAULT_ZERO_EPS = 2.0e-2  # threshold for counting values as "near zero"
+DEFAULT_ZERO_EPS = 2.0e-2  # even looser to trigger early_stop on low-energy tails
 DEFAULT_ZERO_TAIL_FRAMES = 16
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95  # stricter tail check to avoid early truncation
-DEFAULT_ZERO_TAIL_ABSMAX = 1.0  # separate absmax threshold (permissive to allow spikes)
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
@@ -83,20 +80,11 @@ WARMUP_VOICE = os.getenv("ECHO_WARMUP_VOICE")
 WARMUP_TEXT = os.getenv("ECHO_WARMUP_TEXT", "[S1] Warmup compile run.")
 # Chunking config (wiring TBD; previewed in scripts/chunk_preview.py)
 CHUNKING_ENABLED = os.getenv("ECHO_CHUNKING", "1") == "1"
-CHUNK_CHARS_PER_SECOND = float(os.getenv("ECHO_CHUNK_CHARS_PER_SECOND", "14"))
-CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "2.7"))
+CHUNK_CHARS_PER_SECOND = float(os.getenv("ECHO_CHUNK_CHARS_PER_SECOND", "17"))
+CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "3.2"))
 NORMALIZE_EXCLAMATION = os.getenv("ECHO_NORMALIZE_EXCLAMATION", "1") == "1"
 MAX_SPEAKER_LATENT_LENGTH = int(os.getenv("ECHO_MAX_SPEAKER_LATENT_LENGTH", "6400"))
 FOLDER_SUPPORT = os.getenv("ECHO_FOLDER_SUPPORT", "1") == "1"
-# VAD reroll settings
-VAD_REROLL_ENABLED = os.getenv("ECHO_VAD_REROLL_ENABLED", "0") == "1"
-VAD_MAX_REROLLS = int(os.getenv("ECHO_VAD_MAX_REROLLS", "3"))
-VAD_SILENCE_THRESHOLD_MS = int(os.getenv("ECHO_VAD_SILENCE_THRESHOLD_MS", "1000"))
-# Inworld TTS compatibility settings
-INWORLD_COMPAT_ENABLED = os.getenv("ECHO_INWORLD_COMPAT", "1") == "1"
-INWORLD_CLONE_ENABLED = os.getenv("ECHO_INWORLD_CLONE_ENABLED", "0") == "1"
-INWORLD_CLONE_SEPARATOR = "__"  # Inworld format: {workspace}__{voice}
-INWORLD_MAX_SAMPLE_SIZE = int(os.getenv("ECHO_INWORLD_MAX_SAMPLE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
 # Performance presets
 _PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
 PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
@@ -104,7 +92,6 @@ _PERFORMANCE_PRESETS = {
     "default": {"block_sizes": [32, 128, 480], "num_steps": [8, 15, 20]},
     "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
     "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
-    "equal": {"block_sizes": [213, 213, 214], "num_steps": [15, 15, 15]},  # 3x ~10s blocks
     "superfast": {"block_sizes": [16, 112, 512], "num_steps": [4, 12, 20]},
 }
 if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
@@ -129,16 +116,6 @@ if LORA_FIRST_BLOCK:
 # Keep torch.compile caches on restarts similar to test_ttfb_optimization.py
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_cache")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-warnings.filterwarnings(
-    "ignore",
-    message=r".*rel\(\) was called on non-relation expression.*",
-    module=r"torch\.fx\.experimental\.symbolic_shapes",
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*rel\(\) was called on non-relation expression.*",
-    module=r"torch\.fx\.experimental\.symbolic_shapes",
-)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -165,8 +142,6 @@ _LOADED_CACHE_PATHS: set[Path] = set()
 _SAVED_CACHE_PATHS: set[Path] = set()
 _WARMUP_RAN = False
 _COMPILE_DISABLED = False
-_VAD_MODEL = None
-_VAD_UTILS = None
 
 
 def _log_debug(msg: str) -> None:
@@ -256,114 +231,6 @@ def _disable_compile(reason: str) -> None:
         return
     _COMPILE_DISABLED = True
     print(f"⚠️ Disabling torch.compile for this process due to error: {reason}")
-
-
-def _load_vad_model() -> Tuple[Any, Any]:
-    """Load Silero VAD model. Called at startup if VAD reroll is enabled."""
-    global _VAD_MODEL, _VAD_UTILS
-    if _VAD_MODEL is not None:
-        return _VAD_MODEL, _VAD_UTILS
-
-    # Set torch hub cache to match HF cache for unified storage
-    torch.hub.set_dir(os.path.expanduser("~/.cache/huggingface/hub"))
-
-    print("[vad] Loading Silero VAD model...")
-    model, utils = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        trust_repo=True,
-    )
-    model = model.to(DEVICE)
-    _VAD_MODEL = model
-    _VAD_UTILS = utils
-    print(f"[vad] Loaded Silero VAD model on {DEVICE}")
-    return _VAD_MODEL, _VAD_UTILS
-
-
-def _check_silence_vad(audio: torch.Tensor, threshold_ms: int = 1000) -> Tuple[bool, float]:
-    """
-    Check if audio contains silence >= threshold_ms using VAD.
-
-    Args:
-        audio: Audio tensor at 44.1kHz, shape (samples,) or (1, samples) or (1, 1, samples)
-        threshold_ms: Silence threshold in milliseconds
-
-    Returns:
-        (has_long_silence, max_silence_ms): Whether silence >= threshold exists, and max silence duration
-    """
-    if not VAD_REROLL_ENABLED or _VAD_MODEL is None:
-        return False, 0.0
-
-    # Squeeze to 1D
-    original_shape = audio.shape
-    audio = audio.detach().float().cpu().squeeze()
-    audio_duration_sec = audio.numel() / SAMPLE_RATE
-    audio_duration_ms = audio_duration_sec * 1000.0
-
-    _log_debug(f"[vad] Input: shape={original_shape} -> squeezed={audio.shape}, samples={audio.numel()}, duration={audio_duration_ms:.1f}ms")
-
-    if audio.numel() == 0:
-        _log_debug(f"[vad] Empty audio, skipping VAD check")
-        return False, 0.0
-
-    # Resample 44.1kHz -> 16kHz for VAD
-    audio_16k = torchaudio.functional.resample(
-        audio.unsqueeze(0),
-        orig_freq=SAMPLE_RATE,
-        new_freq=16000,
-    ).squeeze()
-
-    # Reset VAD model state before processing new audio
-    _VAD_MODEL.reset_states()
-
-    # Get speech timestamps
-    get_speech_timestamps = _VAD_UTILS[0]
-    speech_timestamps = get_speech_timestamps(
-        audio_16k.to(DEVICE),
-        _VAD_MODEL,
-        sampling_rate=16000,
-        return_seconds=True,
-    )
-
-    threshold_sec = threshold_ms / 1000.0
-
-    _log_debug(f"[vad] Speech segments: {speech_timestamps}")
-
-    # Find max silence gap
-    max_silence_sec = 0.0
-    silence_source = "none"
-
-    if not speech_timestamps:
-        # No speech detected - entire audio is silence
-        max_silence_sec = audio_duration_sec
-        silence_source = "no_speech_detected"
-    else:
-        # Check leading silence
-        first_speech_start = speech_timestamps[0]["start"]
-        if first_speech_start > max_silence_sec:
-            max_silence_sec = first_speech_start
-            silence_source = "leading"
-
-        # Check gaps between speech segments
-        for i in range(len(speech_timestamps) - 1):
-            gap = speech_timestamps[i + 1]["start"] - speech_timestamps[i]["end"]
-            if gap > max_silence_sec:
-                max_silence_sec = gap
-                silence_source = f"gap_{i}"
-
-        # Check trailing silence
-        last_speech_end = speech_timestamps[-1]["end"]
-        trailing_silence = audio_duration_sec - last_speech_end
-        if trailing_silence > max_silence_sec:
-            max_silence_sec = trailing_silence
-            silence_source = "trailing"
-
-    max_silence_ms = max_silence_sec * 1000
-    has_long_silence = max_silence_sec >= threshold_sec
-
-    _log_debug(f"[vad] Result: max_silence={max_silence_ms:.1f}ms ({silence_source}), threshold={threshold_ms}ms, has_long_silence={has_long_silence}")
-
-    return has_long_silence, max_silence_ms
 
 
 def _ensure_cache_aliases(model: torch.nn.Module) -> None:
@@ -481,10 +348,6 @@ def _find_voice_file(name: str) -> Optional[Path]:
     if not sanitized:
         return None
 
-    # Bail out early for strings too long to be filenames (likely base64 audio)
-    if len(sanitized) > 255:
-        return None
-
     roots = _voice_roots()
     name_path = Path(sanitized)
 
@@ -593,8 +456,7 @@ def _decode_base64_audio(encoded: str) -> Tuple[torch.Tensor, str]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 voice: {exc}") from exc
 
-    # Hash the encoded string (not decoded bytes) for consistent cache keys
-    cache_key = f"base64:{sha256(encoded.encode()).hexdigest()}"
+    cache_key = f"base64:{sha256(raw).hexdigest()}"
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw)
@@ -737,8 +599,7 @@ def _get_speaker_latent(voice: str) -> Tuple[torch.Tensor, torch.Tensor]:
     # Check if voice is a directory
     local_path = _find_voice_file(voice)
     is_directory = local_path is not None and local_path.is_dir()
-    voice_display = voice[:50] + "..." if len(voice) > 50 else voice
-    _log_debug(f"[voice] lookup voice={voice_display} path={local_path} is_dir={is_directory}")
+    _log_debug(f"[voice] lookup voice={voice} path={local_path} is_dir={is_directory}")
     if not is_directory and local_path is not None:
         cache_key = f"file:{local_path.resolve()}"
         if cache_key in _SPEAKER_CACHE:
@@ -801,30 +662,6 @@ def _get_speaker_latent(voice: str) -> Tuple[torch.Tensor, torch.Tensor]:
         return _SPEAKER_CACHE[cache_key][0].to(model.device), _SPEAKER_CACHE[cache_key][1].to(model.device)
     
     # Handle single file case (existing logic)
-    # For base64, check cache using hash of the encoded string before decoding
-    # This avoids expensive decode + file I/O on cache hits
-    is_base64 = local_path is None
-    if is_base64:
-        # Strip data URL prefix if present for consistent hashing
-        encoded_for_hash = voice.split(",", 1)[1] if "," in voice else voice
-        cache_key = f"base64:{sha256(encoded_for_hash.encode()).hexdigest()}"
-        if cache_key in _SPEAKER_CACHE:
-            _log_debug(f"[voice] cache hit {cache_key} (base64 pre-decode) {(time.time() - t_start)*1000:.2f} ms")
-            cached_latent, cached_mask = _SPEAKER_CACHE[cache_key]
-            gpu_hit = (
-                _SPEAKER_CACHE_GPU.get(cache_key, {}).get(target_device_key)
-                if CACHE_SPEAKER_ON_GPU
-                else None
-            )
-            if gpu_hit:
-                _log_debug(f"[voice] gpu cache hit {cache_key} dev={target_device_key} {(time.time() - t_start)*1000:.2f} ms")
-                return gpu_hit[0], gpu_hit[1]
-            result = cached_latent.to(target_device), cached_mask.to(target_device)
-            if CACHE_SPEAKER_ON_GPU:
-                _SPEAKER_CACHE_GPU.setdefault(cache_key, {})[target_device_key] = result
-                _log_debug(f"[voice] gpu cache store {cache_key} dev={target_device_key} {(time.time() - t_start)*1000:.2f} ms")
-            return result
-
     load_start = time.time()
     audio, cache_key = _resolve_voice(voice)
     _log_debug(f"[voice] load_audio {cache_key} {(time.time() - load_start)*1000:.2f} ms")
@@ -929,7 +766,6 @@ class SamplerConfig:
     zero_eps: float
     zero_tail_min_frac: float
     zero_tail_frames: int
-    zero_tail_absmax: float
     guidance_mode: GuidanceMode
     max_text_length: int
 
@@ -985,7 +821,6 @@ def _parse_sampler_config(extra_body: Dict[str, Any]) -> SamplerConfig:
         extra_body.get("zero_tail_min_frac", DEFAULT_ZERO_TAIL_MIN_FRAC)
     )
     zero_tail_frames = int(extra_body.get("zero_tail_frames", DEFAULT_ZERO_TAIL_FRAMES))
-    zero_tail_absmax = float(extra_body.get("zero_tail_absmax", DEFAULT_ZERO_TAIL_ABSMAX))
     early_stop_on_zero = bool(extra_body.get("early_stop_on_zero", DEFAULT_EARLY_STOP))
     max_text_length = int(extra_body.get("max_text_length", 768))
 
@@ -1024,7 +859,6 @@ def _parse_sampler_config(extra_body: Dict[str, Any]) -> SamplerConfig:
         zero_eps=zero_eps,
         zero_tail_min_frac=zero_tail_min_frac,
         zero_tail_frames=zero_tail_frames,
-        zero_tail_absmax=zero_tail_absmax,
         guidance_mode=guidance_mode,
         max_text_length=max_text_length,
     )
@@ -1191,20 +1025,6 @@ class StreamingAEDecoder:
             self._emitted_samples = total_samples_global
         return new_audio
 
-    def get_state(self) -> Dict[str, Any]:
-        """Save decoder state for potential reroll."""
-        return {
-            "tail_latents": self._tail_latents.clone() if self._tail_latents is not None else None,
-            "emitted_samples": self._emitted_samples,
-            "total_latents_seen": self._total_latents_seen,
-        }
-
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """Restore decoder state for reroll."""
-        self._tail_latents = state["tail_latents"].clone() if state["tail_latents"] is not None else None
-        self._emitted_samples = state["emitted_samples"]
-        self._total_latents_seen = state["total_latents_seen"]
-
     def is_finished(self, flattening_point: int | None) -> bool:
         if flattening_point is None:
             return False
@@ -1250,52 +1070,17 @@ def _generate_full_audio_bytes(
         zero_tail_frames=cfg.zero_tail_frames,
     )
 
-    max_attempts = VAD_MAX_REROLLS + 1 if VAD_REROLL_ENABLED else 1
-    best_pcm: Optional[bytes] = None
-    best_silence_ms = float("inf")
+    latent_out = sample_fn(
+        model,
+        speaker_latent,
+        speaker_mask,
+        text_input_ids,
+        text_mask,
+        rng_seed,
+    )
 
-    for attempt in range(max_attempts):
-        attempt_seed = rng_seed + attempt
-
-        latent_out = sample_fn(
-            model,
-            speaker_latent,
-            speaker_mask,
-            text_input_ids,
-            text_mask,
-            attempt_seed,
-        )
-
-        audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
-
-        # Apply 50ms fadeout to avoid clicks at end
-        fadeout_samples = min(int(0.05 * SAMPLE_RATE), audio_out.shape[-1])
-        if fadeout_samples > 0:
-            t = torch.linspace(0.0, 1.0, fadeout_samples, device=audio_out.device)
-            fade = (1.0 - t) ** 3
-            audio_out[..., -fadeout_samples:] = audio_out[..., -fadeout_samples:] * fade
-
-        pcm = _audio_to_pcm(audio_out)
-
-        if not VAD_REROLL_ENABLED:
-            break
-
-        has_silence, silence_ms = _check_silence_vad(audio_out, VAD_SILENCE_THRESHOLD_MS)
-
-        if silence_ms < best_silence_ms:
-            best_silence_ms = silence_ms
-            best_pcm = pcm
-
-        if not has_silence:
-            print(f"[vad] Non-stream: passed on attempt {attempt + 1}")
-            break
-        else:
-            if attempt < max_attempts - 1:
-                print(f"[vad] Non-stream: rerolling (attempt {attempt + 1}/{max_attempts}, silence={silence_ms:.0f}ms)")
-            else:
-                print(f"[vad] Non-stream: using best attempt after {max_attempts} tries (silence={best_silence_ms:.0f}ms)")
-                pcm = best_pcm
-
+    audio_out = _ae_decode_with_flatten(fish_ae, pca_state, latent_out)
+    pcm = _audio_to_pcm(audio_out)
     torch.cuda.empty_cache()
     return pcm
 
@@ -1340,7 +1125,6 @@ def _warmup_compile(block_sizes: List[int], num_steps: List[int]) -> None:
                 zero_eps=DEFAULT_ZERO_EPS,
                 zero_tail_min_frac=DEFAULT_ZERO_TAIL_MIN_FRAC,
                 zero_tail_frames=DEFAULT_ZERO_TAIL_FRAMES,
-                zero_tail_absmax=DEFAULT_ZERO_TAIL_ABSMAX,
                 guidance_mode=GuidanceMode.INDEPENDENT,
                 max_text_length=768,
             )
@@ -1541,8 +1325,6 @@ def _stream_blocks(
     first_block_started_at = None
     ttfb_reported = False
     final_block_start_samples = 0
-    # Track seed across blocks for VAD continuity (same seed unless reroll needed)
-    current_seed = rng_seed
 
     for block_idx, (block_size, block_steps) in enumerate(
         zip(cfg.block_sizes, step_counts)
@@ -1602,229 +1384,133 @@ def _stream_blocks(
             kv_cache_latent = _get_first_n_kv_cache(kv_cache_latent_full, batch_size)
         kv_time = time.time() - kv_start
 
-        # VAD reroll loop
-        max_vad_attempts = VAD_MAX_REROLLS + 1 if VAD_REROLL_ENABLED else 1
-        best_x_t: Optional[torch.Tensor] = None
-        best_new_audio: Optional[torch.Tensor] = None
-        best_silence_ms = float("inf")
-        best_attempt = 0  # Track which attempt had least silence
-        successful_attempt = 0  # Track which attempt succeeded (for seed carry-forward)
-        decoder_state_before_block: Optional[Dict[str, Any]] = None
-        if VAD_REROLL_ENABLED:
-            decoder_state_before_block = streaming_decoder.get_state()
-        final_x_t: Optional[torch.Tensor] = None
-        final_new_audio: Optional[torch.Tensor] = None
-        final_diffusion_time = 0.0
-        final_decode_time = 0.0
+        # Time diffusion steps
+        diffusion_start = time.time()
+        x_t = torch.randn((batch_size, block_size, 80), device=block_device, dtype=torch.float32)
+        if block_trunc is not None:
+            x_t = x_t * block_trunc
 
-        for vad_attempt in range(max_vad_attempts):
-            # Restore decoder state for each attempt (except first)
-            if vad_attempt > 0 and decoder_state_before_block is not None:
-                streaming_decoder.set_state(decoder_state_before_block)
+        for i in range(block_steps):
+            t, t_next = t_schedule[i], t_schedule[i + 1]
+            has_cfg = ((t >= cfg.cfg_min_t) * (t <= cfg.cfg_max_t)).item()
 
-            # Seed for this block attempt (only reseed on reroll attempts to preserve RNG flow across blocks)
-            if VAD_REROLL_ENABLED and vad_attempt > 0:
-                block_seed = current_seed + vad_attempt
-                torch.manual_seed(block_seed)
+            if use_lora_block:
+                v_pred = model_for_block(
+                    x=x_t.to(block_dtype),
+                    t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
+                    text_mask=block_text_mask_lora,
+                    speaker_mask=block_speaker_mask_lora,
+                    start_pos=pos_id,
+                    kv_cache_text=kv_cache_text_full_lora,
+                    kv_cache_speaker=kv_cache_speaker_full_lora,
+                    kv_cache_latent=kv_cache_latent_full,
+                ).float()
+            elif has_cfg:
+                v_cond, v_uncond_text, v_uncond_speaker = model_for_block(
+                    x=torch.cat([x_t, x_t, x_t], dim=0).to(block_dtype),
+                    t=(torch.ones((batch_size * 3,), device=block_device) * t).to(block_dtype),
+                    text_mask=block_full_text_mask,
+                    speaker_mask=block_full_speaker_mask,
+                    start_pos=pos_id,
+                    kv_cache_text=kv_cache_text_full,
+                    kv_cache_speaker=kv_cache_speaker_full,
+                    kv_cache_latent=kv_cache_latent_full,
+                ).float().chunk(3, dim=0)
 
-            # Time diffusion steps
-            diffusion_start = time.time()
-            x_t = torch.randn((batch_size, block_size, 80), device=block_device, dtype=torch.float32)
-            if block_trunc is not None:
-                x_t = x_t * block_trunc
-
-            for i in range(block_steps):
-                t, t_next = t_schedule[i], t_schedule[i + 1]
-                has_cfg = ((t >= cfg.cfg_min_t) * (t <= cfg.cfg_max_t)).item()
-
-                if use_lora_block:
-                    v_pred = model_for_block(
-                        x=x_t.to(block_dtype),
-                        t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
-                        text_mask=block_text_mask_lora,
-                        speaker_mask=block_speaker_mask_lora,
-                        start_pos=pos_id,
-                        kv_cache_text=kv_cache_text_full_lora,
-                        kv_cache_speaker=kv_cache_speaker_full_lora,
-                        kv_cache_latent=kv_cache_latent_full,
-                    ).float()
-                elif has_cfg:
-                    v_cond, v_uncond_text, v_uncond_speaker = model_for_block(
-                        x=torch.cat([x_t, x_t, x_t], dim=0).to(block_dtype),
-                        t=(torch.ones((batch_size * 3,), device=block_device) * t).to(block_dtype),
-                        text_mask=block_full_text_mask,
-                        speaker_mask=block_full_speaker_mask,
-                        start_pos=pos_id,
-                        kv_cache_text=kv_cache_text_full,
-                        kv_cache_speaker=kv_cache_speaker_full,
-                        kv_cache_latent=kv_cache_latent_full,
-                    ).float().chunk(3, dim=0)
-
-                    v_pred = (
-                        v_cond
-                        + cfg.cfg_scale_text * (v_cond - v_uncond_text)
-                        + cfg.cfg_scale_speaker * (v_cond - v_uncond_speaker)
-                    )
-                else:
-                    v_pred = model_for_block(
-                        x=x_t.to(block_dtype),
-                        t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
-                        text_mask=block_text_mask,
-                        speaker_mask=block_speaker_mask,
-                        start_pos=pos_id,
-                        kv_cache_text=kv_cache_text,
-                        kv_cache_speaker=kv_cache_speaker,
-                        kv_cache_latent=kv_cache_latent,
-                    ).float()
-
-                if cfg.rescale_k is not None and cfg.rescale_sigma is not None:
-                    v_pred = _temporal_score_rescale(
-                        v_pred, x_t, float(t), cfg.rescale_k, cfg.rescale_sigma
-                    )
-
-                if (
-                    cfg.speaker_kv_scale is not None
-                    and cfg.speaker_kv_min_t is not None
-                    and t_next < cfg.speaker_kv_min_t
-                    and t >= cfg.speaker_kv_min_t
-                ):
-                    target_kv = kv_cache_speaker_full_lora if use_lora_block else kv_cache_speaker_full
-                    _multiply_speaker_kv_cache(
-                        target_kv,
-                        1.0 / cfg.speaker_kv_scale,
-                        text_input_ids.shape[-1],
-                        cfg.speaker_kv_max_layers,
-                    )
-
-                x_t = x_t + v_pred * (t_next - t)
-
-            diffusion_time = time.time() - diffusion_start
-
-            # Temporarily update prefix_latent for flattening point calculation
-            prefix_latent[:, pos_id : pos_id + block_size] = x_t
-
-            # Early stop detection per block
-            early_stop = False
-            if cfg.early_stop_on_zero:
-                tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
-                tail = x_t[:, -tail_len:]
-                tail_abs = torch.abs(tail)
-                zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
-                tail_absmax = float(tail_abs.max().item())
-                zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_tail_absmax
-                if zero_ok:
-                    early_stop = True
-                    if vad_attempt == 0:  # Only log on first attempt
-                        print(
-                            f"[early_stop] block {block_idx+1}/{len(cfg.block_sizes)} "
-                            f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
-                            f"absmax={tail_absmax:.3e} absmax_thresh={cfg.zero_tail_absmax} min_frac={cfg.zero_tail_min_frac}"
-                        )
-                else:
-                    if vad_attempt == 0:  # Only log on first attempt
-                        _log_debug(
-                            f"[zero_tail_check] block {block_idx+1}/{len(cfg.block_sizes)} "
-                            f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
-                            f"absmax={tail_absmax:.3e} absmax_thresh={cfg.zero_tail_absmax} min_frac={cfg.zero_tail_min_frac}"
-                        )
-
-            is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
-            will_finish = early_stop or is_last_planned
-
-            flatten_point = None
-            if will_finish:
-                prefix_latent_trim = prefix_latent[:, :pos_id + block_size]
-                flatten_point = find_flattening_point(prefix_latent_trim[0])
-                already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
-                flatten_point = max(flatten_point, already_emitted_latents)
-
-            # Decode block audio with streaming context
-            decode_start = time.time()
-            new_audio = streaming_decoder.decode_next(
-                x_t.to(next(fish_ae.parameters()).device),
-                flattening_point=flatten_point,
-            )
-            decode_time = time.time() - decode_start
-
-            # VAD check if enabled
-            # Skip VAD if: disabled, or audio too short to contain a silence >= threshold
-            audio_duration_ms = (new_audio.numel() / SAMPLE_RATE) * 1000.0 if new_audio.numel() > 0 else 0.0
-            skip_vad = not VAD_REROLL_ENABLED or audio_duration_ms < VAD_SILENCE_THRESHOLD_MS
-            if skip_vad:
-                final_x_t = x_t
-                final_new_audio = new_audio
-                final_diffusion_time = diffusion_time
-                final_decode_time = decode_time
-                break
-
-            has_silence, silence_ms = _check_silence_vad(new_audio, VAD_SILENCE_THRESHOLD_MS)
-
-            # Track best attempt
-            if silence_ms < best_silence_ms:
-                best_silence_ms = silence_ms
-                best_x_t = x_t.clone()
-                best_new_audio = new_audio.clone() if new_audio.numel() > 0 else new_audio
-                best_attempt = vad_attempt
-
-            if not has_silence:
-                print(f"[vad] Block {block_idx+1}: passed on attempt {vad_attempt + 1}")
-                successful_attempt = vad_attempt
-                final_x_t = x_t
-                final_new_audio = new_audio
-                final_diffusion_time = diffusion_time
-                final_decode_time = decode_time
-                break
+                v_pred = (
+                    v_cond
+                    + cfg.cfg_scale_text * (v_cond - v_uncond_text)
+                    + cfg.cfg_scale_speaker * (v_cond - v_uncond_speaker)
+                )
             else:
-                if vad_attempt < max_vad_attempts - 1:
-                    print(f"[vad] Block {block_idx+1}: rerolling (attempt {vad_attempt + 1}/{max_vad_attempts}, silence={silence_ms:.0f}ms)")
-                else:
-                    print(f"[vad] Block {block_idx+1}: using best attempt after {max_vad_attempts} tries (silence={best_silence_ms:.0f}ms)")
-                    successful_attempt = best_attempt
-                    # Restore decoder state and use best attempt
-                    streaming_decoder.set_state(decoder_state_before_block)
-                    final_x_t = best_x_t
-                    # Recalculate flatten_point with best_x_t
-                    prefix_latent[:, pos_id : pos_id + block_size] = best_x_t
-                    best_flatten_point = None
-                    if will_finish:
-                        prefix_latent_trim = prefix_latent[:, :pos_id + block_size]
-                        best_flatten_point = find_flattening_point(prefix_latent_trim[0])
-                        already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
-                        best_flatten_point = max(best_flatten_point, already_emitted_latents)
-                    # Re-decode with best_x_t
-                    decode_start = time.time()
-                    final_new_audio = streaming_decoder.decode_next(
-                        best_x_t.to(next(fish_ae.parameters()).device),
-                        flattening_point=best_flatten_point,
-                    )
-                    final_decode_time = time.time() - decode_start
-                    final_diffusion_time = diffusion_time  # Use last diffusion time
+                v_pred = model_for_block(
+                    x=x_t.to(block_dtype),
+                    t=(torch.ones((batch_size,), device=block_device) * t).to(block_dtype),
+                    text_mask=block_text_mask,
+                    speaker_mask=block_speaker_mask,
+                    start_pos=pos_id,
+                    kv_cache_text=kv_cache_text,
+                    kv_cache_speaker=kv_cache_speaker,
+                    kv_cache_latent=kv_cache_latent,
+                ).float()
 
-        # Use final results
-        x_t = final_x_t
-        new_audio = final_new_audio
-        diffusion_time = final_diffusion_time
-        decode_time = final_decode_time
+            if cfg.rescale_k is not None and cfg.rescale_sigma is not None:
+                v_pred = _temporal_score_rescale(
+                    v_pred, x_t, float(t), cfg.rescale_k, cfg.rescale_sigma
+                )
 
-        # Carry seed forward for next blocks (only advances if reroll was needed)
-        if VAD_REROLL_ENABLED and successful_attempt > 0:
-            current_seed += successful_attempt
+            if (
+                cfg.speaker_kv_scale is not None
+                and cfg.speaker_kv_min_t is not None
+                and t_next < cfg.speaker_kv_min_t
+                and t >= cfg.speaker_kv_min_t
+            ):
+                target_kv = kv_cache_speaker_full_lora if use_lora_block else kv_cache_speaker_full
+                _multiply_speaker_kv_cache(
+                    target_kv,
+                    1.0 / cfg.speaker_kv_scale,
+                    text_input_ids.shape[-1],
+                    cfg.speaker_kv_max_layers,
+                )
 
-        # Commit to prefix_latent with final x_t
+            x_t = x_t + v_pred * (t_next - t)
+
+        diffusion_time = time.time() - diffusion_start
         prefix_latent[:, pos_id : pos_id + block_size] = x_t
         pos_id += block_size
+
+        # Early stop detection per block
+        early_stop = False
+        if cfg.early_stop_on_zero:
+            tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
+            tail = x_t[:, -tail_len:]
+            tail_abs = torch.abs(tail)
+            zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
+            tail_absmax = float(tail_abs.max().item())
+            zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_eps
+            if zero_ok:
+                early_stop = True
+                print(
+                    f"[early_stop] block {block_idx+1}/{len(cfg.block_sizes)} "
+                    f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
+                    f"absmax={tail_absmax:.3e} eps={cfg.zero_eps} min_frac={cfg.zero_tail_min_frac}"
+                )
+            else:
+                _log_debug(
+                    f"[zero_tail_check] block {block_idx+1}/{len(cfg.block_sizes)} "
+                    f"tail_len={tail_len} zero_frac={zero_frac:.3f} "
+                    f"absmax={tail_absmax:.3e} eps={cfg.zero_eps} min_frac={cfg.zero_tail_min_frac}"
+                )
+
+        is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
+        will_finish = early_stop or is_last_planned
+
+        flatten_point = None
+        if will_finish:
+            prefix_latent_trim = prefix_latent[:, :pos_id]
+            flatten_point = find_flattening_point(prefix_latent_trim[0], window_size=32, std_threshold=0.02)
+            already_emitted_latents = streaming_decoder._emitted_samples // streaming_decoder.samples_per_latent
+            flatten_point = max(flatten_point, already_emitted_latents)
+
+        # Decode block audio with streaming context
+        decode_start = time.time()
+        new_audio = streaming_decoder.decode_next(
+            x_t.to(next(fish_ae.parameters()).device),
+            flattening_point=flatten_point,
+        )
+        decode_time = time.time() - decode_start
 
         # Calculate audio duration and RTFx
         audio_samples = new_audio.numel() if new_audio.numel() > 0 else 0
         audio_duration_ms = (audio_samples / SAMPLE_RATE) * 1000.0 if audio_samples > 0 else 0.0
-
+        
         # Total generation time for this chunk (diffusion + decode)
         chunk_gen_time = time.time() - block_start_time
         chunk_gen_time_ms = chunk_gen_time * 1000.0
-
+        
         # RTFx: generation_time / audio_duration (lower is better, <1.0 means faster than realtime)
         rtfx = chunk_gen_time / (audio_duration_ms / 1000.0) if audio_duration_ms > 0 else 0.0
-
+        
         print(
             f"[chunk {block_idx+1}/{len(cfg.block_sizes)}] "
             f"RTFx={rtfx:.3f} | "
@@ -1842,30 +1528,7 @@ def _stream_blocks(
             ttfb_reported = True
 
         if new_audio.numel() > 0:
-            # Apply 50ms fadeout on last block to avoid clicks
-            if will_finish:
-                fadeout_samples = min(int(0.05 * SAMPLE_RATE), new_audio.shape[-1])
-                if fadeout_samples > 0:
-                    # Power curve fade: gradual at start, steeper drop at end
-                    t = torch.linspace(0.0, 1.0, fadeout_samples, device=new_audio.device)
-                    fade = (1.0 - t) ** 3
-                    new_audio[..., -fadeout_samples:] = new_audio[..., -fadeout_samples:] * fade
             yield _audio_to_pcm(new_audio)
-
-        # Re-evaluate will_finish with final x_t for early stopping
-        early_stop = False
-        if cfg.early_stop_on_zero:
-            tail_len = min(cfg.zero_tail_frames, x_t.shape[1])
-            tail = x_t[:, -tail_len:]
-            tail_abs = torch.abs(tail)
-            zero_frac = float((tail_abs <= cfg.zero_eps).float().mean().item())
-            tail_absmax = float(tail_abs.max().item())
-            zero_ok = zero_frac >= cfg.zero_tail_min_frac and tail_absmax <= cfg.zero_tail_absmax
-            if zero_ok:
-                early_stop = True
-
-        is_last_planned = (block_idx == len(cfg.block_sizes) - 1)
-        will_finish = early_stop or is_last_planned
 
         if will_finish:
             break
@@ -1883,102 +1546,12 @@ class SpeechRequest(BaseModel):
         description="pcm only for streaming; non-stream supports pcm/wav/mp3 (defaults to mp3 if ffmpeg is available, else wav).",
     )
     stream: bool = Field(default=True)
-    extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional overrides (seed, sampler params, etc.)")
-
-
-# Inworld TTS API compatibility models
-class InworldAudioConfig(BaseModel):
-    audioEncoding: str = Field(default="MP3")
-    bitRate: Optional[int] = None
-    sampleRateHertz: Optional[int] = None
-    speakingRate: Optional[float] = None
-
-
-class InworldSynthesizeRequest(BaseModel):
-    text: str = Field(..., max_length=2000)
-    voiceId: str = Field(...)
-    audioConfig: Optional[InworldAudioConfig] = None
-    modelId: str = Field(default="inworld-tts-1")
-    temperature: Optional[float] = None
-    timestampType: Optional[str] = None
-    applyTextNormalization: Optional[str] = None
-
-
-class InworldVoiceSample(BaseModel):
-    audioData: str = Field(...)  # base64-encoded audio
-    transcription: Optional[str] = None
-
-
-class InworldCloneRequest(BaseModel):
-    displayName: str = Field(..., max_length=100)
-    langCode: str = Field(default="EN_US")
-    voiceSamples: List[InworldVoiceSample] = Field(...)
-    description: Optional[str] = None
-    tags: Optional[List[str]] = None
-    audioProcessingConfig: Optional[Dict[str, Any]] = None
-
-
-def _sanitize_voice_name(name: str) -> str:
-    """Sanitize voice name for filesystem safety.
-
-    Allows only alphanumeric, underscore, hyphen, and space characters.
-    Returns sanitized name or raises HTTPException if result is empty.
-    """
-    # Remove any path separators and dangerous characters
-    sanitized = re.sub(r'[^a-zA-Z0-9_\- ]', '', name)
-    sanitized = sanitized.strip()[:100]
-    if not sanitized:
-        raise HTTPException(status_code=400, detail="Invalid voice name: must contain alphanumeric characters")
-    return sanitized
-
-
-def _validate_audio_header(data: bytes) -> str:
-    """Validate audio file header, return detected format.
-
-    Only allows WAV and MP3 formats. Raises HTTPException for unsupported formats.
-    """
-    if len(data) < 12:
-        raise HTTPException(status_code=400, detail="Audio data too short to validate")
-
-    # WAV: starts with RIFF....WAVE
-    if data[:4] == b'RIFF' and data[8:12] == b'WAVE':
-        return 'wav'
-
-    # MP3: ID3 tag or frame sync
-    if data[:3] == b'ID3':
-        return 'mp3'
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        return 'mp3'
-
-    raise HTTPException(status_code=400, detail="Unsupported audio format: only WAV and MP3 are allowed")
-
-
-# Inworld gRPC-style error codes
-INWORLD_ERROR_INVALID_ARGUMENT = 3
-INWORLD_ERROR_NOT_FOUND = 5
-INWORLD_ERROR_INTERNAL = 13
-
-
-def _inworld_error_response(code: int, message: str, http_status: int = 400) -> JSONResponse:
-    """Return Inworld-compatible error response for non-streaming endpoints."""
-    return JSONResponse(
-        status_code=http_status,
-        content={"code": code, "message": message, "details": []},
-    )
-
-
-def _inworld_stream_error_response(code: int, message: str, http_status: int = 400) -> JSONResponse:
-    """Return Inworld-compatible error response for streaming endpoints."""
-    return JSONResponse(
-        status_code=http_status,
-        content={"error": {"code": code, "message": message, "details": []}},
-    )
+    seed: int = Field(default=0)
+    extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional sampler overrides")
 
 
 def _run_startup_tasks() -> None:
     _load_components()
-    if VAD_REROLL_ENABLED:
-        _load_vad_model()
     _load_compile_cache(DEFAULT_BLOCK_SIZES)
     if DEFAULT_BLOCK_SIZES != [DEFAULT_BLOCK_SIZE_NONSTREAM]:
         _load_compile_cache([DEFAULT_BLOCK_SIZE_NONSTREAM])
@@ -1991,9 +1564,12 @@ def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     if requested is None or str(requested).strip() == "":
         return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
     fmt = str(requested).strip().lower()
-    if fmt not in {"pcm", "wav", "mp3"}:
+    allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
+    if fmt not in allowed:
         raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
-    if fmt == "mp3" and not FFMPEG_PATH:
+    if stream and fmt != "pcm":
+        raise HTTPException(status_code=400, detail="Streaming currently supports response_format='pcm' only")
+    if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
         raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
     return fmt
 
@@ -2016,10 +1592,6 @@ def list_voices() -> Dict[str, Any]:
 @app.post("/v1/audio/speech")
 def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> StreamingResponse:
     route_start = time.time()
-    # Extract seed from extra_body, default to random (-1)
-    seed = int(payload.extra_body.get("seed", -1))
-    if seed < 0:
-        seed = random.randint(0, 2**31 - 1)
     _load_components()
     _log_debug(f"[route] after load_components: {(time.time() - route_start)*1000:.2f} ms")
     response_format = _resolve_response_format(payload.response_format, payload.stream)
@@ -2057,20 +1629,12 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     else:
         chunks = [payload.input]
     _log_debug(f"[route] chunking_enabled={chunking_enabled} chunks={len(chunks)}")
-    for i, chunk in enumerate(chunks):
-        chunk_preview = chunk[:100] + "..." if len(chunk) > 100 else chunk
-        _log_debug(f"[route] chunk {i+1}/{len(chunks)}: {chunk_preview!r}")
 
     if not payload.stream:
         if "block_sizes" not in payload.extra_body:
             sampler_cfg.block_sizes = [DEFAULT_BLOCK_SIZE_NONSTREAM]
-        num_steps_raw = payload.extra_body.get("num_steps")
-        if num_steps_raw is None:
-            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM]
-        elif isinstance(num_steps_raw, int):
-            sampler_cfg.num_steps = [num_steps_raw]
-        else:
-            sampler_cfg.num_steps = [int(x) for x in num_steps_raw]
+        if "num_steps" not in payload.extra_body:
+            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM for _ in sampler_cfg.block_sizes]
 
     chunk_cfgs: List[SamplerConfig]
     override_secondary = (
@@ -2091,14 +1655,12 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
         chunk_cfgs = [sampler_cfg for _ in chunks]
 
     if payload.stream:
-        # For wav/mp3 format, we must collect all chunks then convert; for pcm, stream directly
-        stream_buffered = response_format in ("wav", "mp3")
-        collected: Optional[bytearray] = bytearray() if (DEBUG_LOGS_ENABLED or stream_buffered) else None
+        collected: Optional[bytearray] = bytearray() if DEBUG_LOGS_ENABLED else None
         disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
 
         def _run_stream() -> Iterable[bytes]:
             for idx, chunk in enumerate(chunks):
-                chunk_seed = seed + idx
+                chunk_seed = payload.seed + idx
                 cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
                 _log_debug(f"[route] starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
                 for block in _stream_blocks(
@@ -2140,9 +1702,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         emitted = True
                         if collected is not None:
                             collected.extend(chunk)
-                        # For wav/mp3 format, don't yield chunks - we'll convert and yield at end
-                        if not stream_buffered:
-                            yield chunk
+                        yield chunk
                 except disconnect_exception:
                     _log_debug("[route] disconnect propagated; aborting remaining chunks")
                 except RuntimeError as exc:
@@ -2156,25 +1716,15 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         async for chunk in _drain_stream(stream_iter):
                             if collected is not None:
                                 collected.extend(chunk)
-                            if not stream_buffered:
-                                yield chunk
+                            yield chunk
                     else:
                         raise
             finally:
                 _close_iter(stream_iter)
 
-            # For wav/mp3 format, convert accumulated PCM and yield at end
-            if stream_buffered and collected:
-                pcm_bytes = bytes(collected)
-                if response_format == "wav":
-                    yield _pcm16_to_wav_bytes(pcm_bytes, SAMPLE_RATE)
-                elif response_format == "mp3":
-                    yield _encode_mp3_from_pcm(pcm_bytes, SAMPLE_RATE)
-
-        stream_media_type = {"wav": "audio/wav", "mp3": "audio/mpeg"}.get(response_format, "application/octet-stream")
         response = StreamingResponse(
             _generator(),
-            media_type=stream_media_type,
+            media_type="application/octet-stream",
             headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
         )
         _log_debug(
@@ -2198,7 +1748,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     try:
         collected = bytearray()
         for idx, chunk in enumerate(chunks):
-            chunk_seed = seed + idx
+            chunk_seed = payload.seed + idx
             cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
             _log_debug(f"[route] (non-stream) starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
             audio_tensor = _generate_full_audio_bytes(
@@ -2216,7 +1766,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             _load_components(force_reinit=True, force_compile=False)
             collected = bytearray()
             for idx, chunk in enumerate(chunks):
-                chunk_seed = seed + idx
+                chunk_seed = payload.seed + idx
                 cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
                 _log_debug(f"[route] (non-stream) retry chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
                 audio_tensor_part = _generate_full_audio_bytes(
@@ -2254,432 +1804,235 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     )
 
 
-# ============================================================================
-# Inworld TTS API Compatibility Endpoints
-# ============================================================================
+# WebSocket lock to prevent concurrent generation (single GPU)
+_WS_LOCK: Optional[asyncio.Lock] = None
 
 
-@app.get("/tts/v1/voices")
-def inworld_list_voices(filter: Optional[str] = None):
-    """Inworld-compatible list voices endpoint.
+def _get_ws_lock() -> asyncio.Lock:
+    """Get or create the WebSocket lock."""
+    global _WS_LOCK
+    if _WS_LOCK is None:
+        _WS_LOCK = asyncio.Lock()
+    return _WS_LOCK
 
-    Returns all available voices (built-in and cloned).
-    Supports optional filter parameter (e.g., filter=language=en).
+
+def _get_timestamp() -> str:
+    """Get ISO timestamp for log messages."""
+    import datetime
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+@app.websocket("/stream")
+async def websocket_stream(ws: WebSocket) -> None:
     """
-    if not INWORLD_COMPAT_ENABLED:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
-
-    # Parse filter if provided (currently only language filter is supported)
-    language_filter = None
-    if filter:
-        if filter.startswith("language="):
-            language_filter = filter.split("=", 1)[1].lower()
-
-    voices = []
-
-    # Collect all voice files from VOICE_DIRS
-    seen_voices = set()
-    for voice_dir in VOICE_DIRS:
-        if not voice_dir.exists():
-            continue
-        for ext in _AUDIO_EXTS:
-            for voice_path in voice_dir.glob(f"*{ext}"):
-                voice_name = voice_path.stem
-                if voice_name in seen_voices:
-                    continue
-                seen_voices.add(voice_name)
-
-                # Determine if this is a cloned voice (has __ separator)
-                is_cloned = INWORLD_CLONE_SEPARATOR in voice_name
-
-                # Apply language filter (we assume all voices are English for now)
-                if language_filter and language_filter != "en":
-                    continue
-
-                voices.append({
-                    "languages": ["en"],
-                    "voiceId": voice_name,
-                    "displayName": voice_name.split(INWORLD_CLONE_SEPARATOR)[-1] if is_cloned else voice_name,
-                    "description": f"{'Cloned' if is_cloned else 'Built-in'} voice",
-                    "tags": ["cloned"] if is_cloned else ["built-in"],
-                })
-
-    # Also include folders if folder support is enabled
-    if FOLDER_SUPPORT:
-        for voice_dir in VOICE_DIRS:
-            if not voice_dir.exists():
-                continue
-            for item in voice_dir.iterdir():
-                if item.is_dir() and item.name not in seen_voices:
-                    seen_voices.add(item.name)
-                    is_cloned = INWORLD_CLONE_SEPARATOR in item.name
-
-                    if language_filter and language_filter != "en":
-                        continue
-
-                    voices.append({
-                        "languages": ["en"],
-                        "voiceId": item.name,
-                        "displayName": item.name.split(INWORLD_CLONE_SEPARATOR)[-1] if is_cloned else item.name,
-                        "description": f"{'Cloned' if is_cloned else 'Built-in'} voice folder",
-                        "tags": ["cloned", "folder"] if is_cloned else ["built-in", "folder"],
-                    })
-
-    return {"voices": voices}
-
-
-@app.post("/tts/v1/voice")
-def inworld_synthesize(payload: InworldSynthesizeRequest):
-    """Inworld-compatible speech synthesis endpoint.
-
-    Accepts Inworld TTS API format and returns base64-encoded audio.
+    WebSocket endpoint for streaming TTS, compatible with Pipecat.
+    
+    Query params:
+        text: Text to synthesize
+        voice: Voice name (from audio_prompts/)
+        seed: Random seed (default: 0)
+        cfg_scale_text: Text CFG scale (default: 3.0)
+        cfg_scale_speaker: Speaker CFG scale (default: 8.0)
+    
+    Streams PCM16 audio bytes (44.1kHz, mono, int16).
+    Also sends JSON log messages for events.
     """
-    if not INWORLD_COMPAT_ENABLED:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
-
-    # Map audioEncoding to response_format
-    audio_encoding = "MP3"
-    if payload.audioConfig is not None and payload.audioConfig.audioEncoding:
-        audio_encoding = payload.audioConfig.audioEncoding.upper()
-
-    if audio_encoding == "LINEAR16":
-        response_format = "wav"
-    elif audio_encoding == "MP3":
-        response_format = "mp3"
-    else:
-        return _inworld_error_response(
-            INWORLD_ERROR_INVALID_ARGUMENT,
-            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
-        )
-
-    # Check MP3 availability
-    if response_format == "mp3" and not FFMPEG_PATH:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "MP3 encoding requires ffmpeg in PATH")
-
-    # Get speaker latent - voiceId is used directly (includes workspace prefix for cloned voices)
-    voice_id = payload.voiceId
-
-    # Check if voice exists - don't fall through to base64 detection
-    voice_path = _find_voice_file(voice_id)
-    if not voice_path:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice_id}' not found", 404)
-
+    await ws.accept()
+    
+    # Parse query params
+    text = ws.query_params.get("text", "")
+    voice = ws.query_params.get("voice", "")
+    seed_param = ws.query_params.get("seed", "0")
+    cfg_text_param = ws.query_params.get("cfg_scale_text")
+    cfg_speaker_param = ws.query_params.get("cfg_scale_speaker")
+    
+    print(f"[ws] Client connected, text={text[:50]!r}... voice={voice}")
+    
     try:
-        speaker_latent, speaker_mask = _get_speaker_latent(voice_id)
-    except Exception as exc:
-        return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to load voice '{voice_id}': {exc}", 500)
-
-    # Use streaming generation internally (has early stop benefits) but return all at once
-    sampler_cfg = _parse_sampler_config({})
-    seed = random.randint(0, 2**31 - 1)
-
-    # Collect all PCM chunks from streaming generation
-    pcm_chunks = []
-    for pcm_chunk in _stream_blocks(
-        text=payload.text,
-        speaker_latent=speaker_latent,
-        speaker_mask=speaker_mask,
-        cfg=sampler_cfg,
-        rng_seed=seed,
-    ):
-        pcm_chunks.append(pcm_chunk)
-
-    pcm_bytes = b"".join(pcm_chunks)
-
-    # Convert to requested format
-    if response_format == "wav":
-        audio_bytes = _pcm16_to_wav_bytes(pcm_bytes, SAMPLE_RATE)
-    else:  # mp3
-        audio_bytes = _encode_mp3_from_pcm(pcm_bytes, SAMPLE_RATE)
-
-    # Base64 encode
-    audio_content = base64.b64encode(audio_bytes).decode("utf-8")
-
-    # Return Inworld-compatible response with empty timestamp arrays
-    return {
-        "audioContent": audio_content,
-        "timestampInfo": {
-            "wordAlignment": {
-                "words": [],
-                "wordStartTimeSeconds": [],
-                "wordEndTimeSeconds": [],
+        seed = int(seed_param)
+    except ValueError:
+        seed = 0
+    
+    try:
+        cfg_scale_text = float(cfg_text_param) if cfg_text_param else DEFAULT_CFG_TEXT
+    except ValueError:
+        cfg_scale_text = DEFAULT_CFG_TEXT
+    
+    try:
+        cfg_scale_speaker = float(cfg_speaker_param) if cfg_speaker_param else DEFAULT_CFG_SPEAKER
+    except ValueError:
+        cfg_scale_speaker = DEFAULT_CFG_SPEAKER
+    
+    lock = _get_ws_lock()
+    
+    # Check if already processing
+    if lock.locked():
+        busy_message = {
+            "type": "log",
+            "event": "backend_busy",
+            "data": {"message": "Server is busy processing another request. Please wait."},
+            "timestamp": _get_timestamp(),
+        }
+        print("[ws] Server busy, rejecting connection")
+        try:
+            await ws.send_text(json.dumps(busy_message))
+        except Exception:
+            pass
+        await ws.close(code=1013, reason="Service busy")
+        return
+    
+    acquired = False
+    try:
+        await lock.acquire()
+        acquired = True
+        
+        # Send request received log
+        await ws.send_text(json.dumps({
+            "type": "log",
+            "event": "backend_request_received",
+            "data": {
+                "text_length": len(text),
+                "voice": voice,
+                "seed": seed,
+                "cfg_scale_text": cfg_scale_text,
+                "cfg_scale_speaker": cfg_scale_speaker,
             },
-            "characterAlignment": {
-                "characters": [],
-                "characterStartTimeSeconds": [],
-                "characterEndTimeSeconds": [],
-            },
-        },
-    }
-
-
-@app.post("/tts/v1/voice:stream")
-def inworld_synthesize_stream(request: Request, payload: InworldSynthesizeRequest):
-    """Inworld-compatible streaming speech synthesis endpoint.
-
-    Streams audio chunks as JSON objects with base64-encoded audio.
-    Each chunk for LINEAR16 contains a complete WAV header.
-    """
-    if not INWORLD_COMPAT_ENABLED:
-        return _inworld_stream_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
-
-    # Map audioEncoding to response_format
-    audio_encoding = "MP3"
-    if payload.audioConfig is not None and payload.audioConfig.audioEncoding:
-        audio_encoding = payload.audioConfig.audioEncoding.upper()
-
-    if audio_encoding == "LINEAR16":
-        response_format = "wav"
-    elif audio_encoding == "MP3":
-        response_format = "mp3"
-    else:
-        return _inworld_stream_error_response(
-            INWORLD_ERROR_INVALID_ARGUMENT,
-            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
+            "timestamp": _get_timestamp(),
+        }))
+        
+        # Load components and get speaker latent
+        _load_components()
+        
+        if not voice:
+            # Use first available voice
+            voice_options = _list_voice_options()
+            if voice_options:
+                voice = voice_options[0]["id"]
+            else:
+                await ws.send_text(json.dumps({
+                    "type": "log",
+                    "event": "error",
+                    "data": {"message": "No voices available"},
+                    "timestamp": _get_timestamp(),
+                }))
+                await ws.close(code=1011, reason="No voices available")
+                return
+        
+        try:
+            speaker_latent, speaker_mask = _get_speaker_latent(voice)
+        except HTTPException as e:
+            await ws.send_text(json.dumps({
+                "type": "log",
+                "event": "error",
+                "data": {"message": f"Voice error: {e.detail}"},
+                "timestamp": _get_timestamp(),
+            }))
+            await ws.close(code=1011, reason=str(e.detail))
+            return
+        
+        # Build sampler config
+        sampler_cfg = SamplerConfig(
+            block_sizes=DEFAULT_BLOCK_SIZES,
+            num_steps=DEFAULT_NUM_STEPS,
+            cfg_scale_text=cfg_scale_text,
+            cfg_scale_speaker=cfg_scale_speaker,
+            cfg_min_t=DEFAULT_CFG_MIN_T,
+            cfg_max_t=DEFAULT_CFG_MAX_T,
+            truncation_factor=None,
+            init_scale=None,
+            rescale_k=None,
+            rescale_sigma=None,
+            speaker_kv_scale=None,
+            speaker_kv_min_t=None,
+            speaker_kv_max_layers=None,
+            early_stop_on_zero=DEFAULT_EARLY_STOP,
+            zero_eps=DEFAULT_ZERO_EPS,
+            zero_tail_min_frac=DEFAULT_ZERO_TAIL_MIN_FRAC,
+            zero_tail_frames=DEFAULT_ZERO_TAIL_FRAMES,
+            guidance_mode=GuidanceMode.INDEPENDENT,
+            max_text_length=768,
         )
-
-    # Check MP3 availability
-    if response_format == "mp3" and not FFMPEG_PATH:
-        return _inworld_stream_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "MP3 encoding requires ffmpeg in PATH")
-
-    # Get speaker latent - voiceId is used directly (includes workspace prefix for cloned voices)
-    voice_id = payload.voiceId
-
-    # Check if voice exists - don't fall through to base64 detection
-    voice_path = _find_voice_file(voice_id)
-    if not voice_path:
-        return _inworld_stream_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice_id}' not found", 404)
-
-    try:
-        speaker_latent, speaker_mask = _get_speaker_latent(voice_id)
-    except Exception as exc:
-        return _inworld_stream_error_response(INWORLD_ERROR_INTERNAL, f"Failed to load voice '{voice_id}': {exc}", 500)
-
-    # Use streaming sampler config
-    sampler_cfg = _parse_sampler_config({})
-    seed = random.randint(0, 2**31 - 1)
-
-    def generate_chunks() -> Iterator[bytes]:
-        """Generate JSON chunks with base64-encoded audio."""
-        for pcm_chunk in _stream_blocks(
-            text=payload.text,
-            speaker_latent=speaker_latent,
-            speaker_mask=speaker_mask,
-            cfg=sampler_cfg,
-            rng_seed=seed,
-        ):
-            # Convert PCM to requested format
-            if response_format == "wav":
-                # Each chunk gets its own WAV header for independent playback
-                audio_bytes = _pcm16_to_wav_bytes(pcm_chunk, SAMPLE_RATE)
-            else:  # mp3
-                audio_bytes = _encode_mp3_from_pcm(pcm_chunk, SAMPLE_RATE)
-
-            # Create Inworld-compatible JSON chunk
-            chunk_response = {
-                "result": {
-                    "audioContent": base64.b64encode(audio_bytes).decode("utf-8"),
-                    "timestampInfo": {
-                        "wordAlignment": {
-                            "words": [],
-                            "wordStartTimeSeconds": [],
-                            "wordEndTimeSeconds": [],
-                        },
-                        "characterAlignment": {
-                            "characters": [],
-                            "characterStartTimeSeconds": [],
-                            "characterEndTimeSeconds": [],
-                        },
-                    },
-                }
-            }
-            yield json.dumps(chunk_response).encode("utf-8") + b"\n"
-
-    return StreamingResponse(
-        generate_chunks(),
-        media_type="application/json",
-        headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
-    )
-
-
-@app.post("/voices/v1/workspaces/{workspace}/voices:clone")
-def inworld_clone_voice(workspace: str, payload: InworldCloneRequest):
-    """Inworld-compatible voice cloning endpoint.
-
-    Saves uploaded voice samples with Inworld format: {workspace}__{voice}
-    """
-    if not INWORLD_CLONE_ENABLED:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Voice cloning is disabled. Set ECHO_INWORLD_CLONE_ENABLED=1 to enable.", 404)
-
-    # Sanitize workspace and display name
-    try:
-        sanitized_workspace = _sanitize_voice_name(workspace)
-        sanitized_name = _sanitize_voice_name(payload.displayName)
-    except HTTPException as exc:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
-
-    # Inworld format: {workspace}__{voice}
-    voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_name}"
-
-    # Check if voice already exists (check both .wav and .mp3)
-    if _find_voice_file(voice_id):
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, f"Voice '{voice_id}' already exists")
-
-    if not payload.voiceSamples:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "At least one voice sample is required")
-
-    # Process the first voice sample (we only support single sample for now)
-    sample = payload.voiceSamples[0]
-
-    # Decode base64 audio
-    try:
-        # Strip data URL prefix if present
-        audio_data_str = sample.audioData
-        if "," in audio_data_str and audio_data_str.startswith("data:"):
-            audio_data_str = audio_data_str.split(",", 1)[1]
-        audio_data = base64.b64decode(audio_data_str, validate=True)
-    except Exception as exc:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, f"Invalid base64 audio data: {exc}")
-
-    # Check file size
-    if len(audio_data) > INWORLD_MAX_SAMPLE_SIZE:
-        return _inworld_error_response(
-            INWORLD_ERROR_INVALID_ARGUMENT,
-            f"Voice sample exceeds maximum size of {INWORLD_MAX_SAMPLE_SIZE // (1024*1024)} MB"
-        )
-
-    # Validate audio format
-    try:
-        audio_format = _validate_audio_header(audio_data)
-    except HTTPException as exc:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
-
-    # Save to audio_prompts directory
-    file_extension = audio_format
-    voice_path = VOICE_DIRS[0] / f"{voice_id}.{file_extension}"
-
-    try:
-        # Ensure directory exists
-        voice_path.parent.mkdir(parents=True, exist_ok=True)
-        voice_path.write_bytes(audio_data)
-    except Exception as exc:
-        return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to save voice file: {exc}", 500)
-
-    _log_debug(f"[inworld] Created cloned voice: {voice_id} at {voice_path}")
-
-    # Return Inworld-compatible response
-    # voiceId is Inworld format: {workspace}__{voice}
-    return {
-        "voice": {
-            "name": f"workspaces/{sanitized_workspace}/voices/{sanitized_name}",
-            "voiceId": voice_id,  # Full format: {workspace}__{voice}
-            "displayName": payload.displayName,
-            "langCode": payload.langCode,
-            "description": payload.description or "",
-            "tags": payload.tags or [],
-        },
-        "audioSamplesValidated": [
-            {
-                "langCode": payload.langCode,
-                "warnings": [],
-                "errors": [],
-                "transcription": sample.transcription or "",
-            }
-        ],
-    }
-
-
-@app.get("/voices/v1/workspaces/{workspace}/voices/{voice}")
-def inworld_get_voice(workspace: str, voice: str):
-    """Inworld-compatible get voice endpoint.
-
-    Returns voice metadata. Works for both cloned and built-in voices.
-    """
-    if not INWORLD_COMPAT_ENABLED:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Inworld compatibility endpoints are disabled", 404)
-
-    # Sanitize workspace and voice name
-    try:
-        sanitized_workspace = _sanitize_voice_name(workspace)
-        sanitized_voice = _sanitize_voice_name(voice)
-    except HTTPException as exc:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
-
-    # Try to find the voice - Inworld format first ({workspace}__{voice}), then plain
-    inworld_voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_voice}"
-    voice_path = _find_voice_file(inworld_voice_id)
-    is_cloned = voice_path is not None
-
-    if not is_cloned:
-        voice_path = _find_voice_file(sanitized_voice)
-
-    if voice_path is None:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice}' not found", 404)
-
-    # Return Inworld-compatible voice metadata
-    effective_voice_id = inworld_voice_id if is_cloned else sanitized_voice
-    return {
-        "name": f"workspaces/{sanitized_workspace}/voices/{sanitized_voice}",
-        "voiceId": effective_voice_id,
-        "displayName": sanitized_voice,
-        "langCode": "EN_US",
-        "description": f"{'Cloned' if is_cloned else 'Built-in'} voice: {sanitized_voice}",
-        "tags": ["cloned"] if is_cloned else ["built-in"],
-    }
-
-
-@app.delete("/voices/v1/workspaces/{workspace}/voices/{voice}")
-def inworld_delete_voice(workspace: str, voice: str, etag: Optional[str] = None):
-    """Inworld-compatible voice deletion endpoint.
-
-    Only allows deletion of cloned voices (those with {workspace}__ prefix).
-    """
-    if not INWORLD_CLONE_ENABLED:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, "Voice management is disabled. Set ECHO_INWORLD_CLONE_ENABLED=1 to enable.", 404)
-
-    # Sanitize to prevent path traversal
-    try:
-        sanitized_workspace = _sanitize_voice_name(workspace)
-        sanitized_voice = _sanitize_voice_name(voice)
-    except HTTPException as exc:
-        return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, exc.detail)
-
-    # Inworld format: {workspace}__{voice} - only these can be deleted
-    inworld_voice_id = f"{sanitized_workspace}{INWORLD_CLONE_SEPARATOR}{sanitized_voice}"
-
-    # Find and delete the voice file
-    deleted = False
-    for voice_dir in VOICE_DIRS:
-        for ext in [".wav", ".mp3"]:
-            voice_path = voice_dir / f"{inworld_voice_id}{ext}"
-            if voice_path.exists():
-                # Extra safety: verify path is within allowed directories
-                if not _is_path_within_voice_dirs(voice_path, _voice_roots()):
-                    return _inworld_error_response(INWORLD_ERROR_INVALID_ARGUMENT, "Access denied", 403)
-                try:
-                    voice_path.unlink()
-                    deleted = True
-                    _log_debug(f"[inworld] Deleted voice: {inworld_voice_id} at {voice_path}")
-
-                    # Clear from speaker cache
-                    cache_key = f"file:{voice_path.resolve()}"
-                    if cache_key in _SPEAKER_CACHE:
-                        del _SPEAKER_CACHE[cache_key]
-                    # Also try to clear from GPU cache if enabled
-                    if CACHE_SPEAKER_ON_GPU:
-                        for device_cache in _SPEAKER_CACHE_GPU.values():
-                            if cache_key in device_cache:
-                                del device_cache[cache_key]
+        
+        # Stream audio blocks
+        first_chunk_sent = False
+        
+        def run_stream() -> Iterator[bytes]:
+            for block in _stream_blocks(
+                text=text,
+                speaker_latent=speaker_latent,
+                speaker_mask=speaker_mask,
+                cfg=sampler_cfg,
+                rng_seed=seed,
+            ):
+                yield block
+        
+        try:
+            stream_iter = run_stream()
+            sentinel = object()
+            
+            while ws.client_state == WebSocketState.CONNECTED:
+                # Get next chunk in thread pool to not block event loop
+                chunk = await asyncio.to_thread(next, stream_iter, sentinel)
+                if chunk is sentinel:
                     break
-                except Exception as exc:
-                    return _inworld_error_response(INWORLD_ERROR_INTERNAL, f"Failed to delete voice: {exc}", 500)
-        if deleted:
-            break
+                
+                # Send audio bytes
+                await ws.send_bytes(chunk)
+                
+                if not first_chunk_sent:
+                    first_chunk_sent = True
+                    await ws.send_text(json.dumps({
+                        "type": "log",
+                        "event": "backend_first_chunk_sent",
+                        "data": {},
+                        "timestamp": _get_timestamp(),
+                    }))
+                    
+        except WebSocketDisconnect:
+            print("[ws] Client disconnected")
+        except Exception as e:
+            print(f"[ws] Error during streaming: {e}")
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "log",
+                    "event": "error",
+                    "data": {"message": str(e)},
+                    "timestamp": _get_timestamp(),
+                }))
+            except Exception:
+                pass
+        finally:
+            # Send completion message
+            try:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    await ws.send_text(json.dumps({
+                        "type": "log",
+                        "event": "backend_stream_complete",
+                        "data": {},
+                        "timestamp": _get_timestamp(),
+                    }))
+                    await ws.close()
+            except Exception:
+                pass
+            print("[ws] Handler exit")
+            
+    finally:
+        if acquired:
+            lock.release()
 
-    if not deleted:
-        return _inworld_error_response(INWORLD_ERROR_NOT_FOUND, f"Voice '{voice}' not found", 404)
 
-    return {}
+@app.get("/config")
+def get_config() -> Dict[str, Any]:
+    """
+    Get server configuration including available voices.
+    Compatible with Pipecat's voice listing.
+    """
+    voices = [v["id"] for v in _list_voice_options()]
+    return {
+        "voices": voices,
+        "default_voice": voices[0] if voices else None,
+        "sample_rate": SAMPLE_RATE,
+    }
 
 
 if __name__ == "__main__":
