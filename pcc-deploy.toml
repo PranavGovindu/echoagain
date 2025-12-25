@@ -1,9 +1,9 @@
 # Pipecat Cloud Deployment Configuration
 # Update these values for your deployment
 
-agent_name = "echo-tts-kiran"
+agent_name = "echo-tts-kirannn"
 image = "pranav2722/echo-tts-kiran:latest"
-secret_set = "echo-secrets-help"  # Create this in Pipecat Cloud with GOOGLE_API_KEY and ECHO_SERVER_URL
+secret_set = "echo-secrets-helps"  # Create this in Pipecat Cloud with GOOGLE_API_KEY and ECHO_SERVER_URL
 agent_profile = "agent-2x"
 
 [krisp_viva]
